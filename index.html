@@ -1,0 +1,2982 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>أوزون لحلول تنقية المياه — نظام إدارة العملاء والصيانة</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #F3F7F7; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react",
+    "xlsx": "https://esm.sh/xlsx@0.18.5"
+  }
+}
+</script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  Users, Wrench, Calendar, AlertTriangle, Search, Plus, Phone, MapPin,
+  Droplets, User, Pencil, Trash2, X, Check, Clock, Coins, ChevronRight,
+  ChevronLeft, CircleCheck, CircleAlert, Filter, ArrowRight, Bell,
+  Download, Upload, Cloud,
+} from "lucide-react";
+import * as XLSX from "xlsx";
+
+/* ============================== CONSTANTS ============================== */
+
+const STORAGE_KEY = "ozon_crm_customers_v1";
+const SHEETS_KEY = "ozon_crm_sheets_v1";
+// ---- إعدادات الربط الثابتة (بتشتغل على أي جهاز بدون إدخال) ----
+// حط كلمة السر بتاعتك مكان PUT_YOUR_SECRET_HERE (نفس SECRET اللي في كود Apps Script)
+const DEFAULT_SHEETS_URL = "https://script.google.com/macros/s/AKfycbxVebWQW6PejUwHBNDueMe09pfr1xS4lFpVOLW9vkPWEIbZP8ayN84jgiroXDGY4RRo/exec";
+const DEFAULT_SHEETS_SECRET = "Elkhateeb";
+const CANDLE_OPTIONS = [1, 2, 3, 4, 5, 6, 7];
+const MONTH_NAMES = [
+  "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+  "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+];
+const DELAY_REASON_PRESETS = [
+  "العميل مسافر",
+  "العميل طلب التأجيل",
+  "العميل لم يرد",
+  "تم تأجيل الموعد",
+  "لم يتم التواصل مع العميل",
+];
+
+/* ============================== UTILITIES ============================== */
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+}
+
+// Suggests the next customer code based on the LAST customer added (customers[0],
+// since new customers are prepended to the list). It keeps the same prefix/format
+// and just increments the trailing number — e.g. B-2 -> B-3, C-1 -> C-2.
+// Falls back to OZ-0001 style if there's no previous customer or its code has no
+// trailing number to increment.
+function nextCustomerCode(customers) {
+  const list = customers || [];
+  const last = list[0];
+  const lastCode = last ? String(last.code || "").trim() : "";
+  const match = lastCode.match(/^(.*?)(\d+)$/);
+  if (!match) return "OZ-0001";
+  const prefix = match[1];
+  const digits = match[2];
+  const nextNum = parseInt(digits, 10) + 1;
+  const nextDigits = String(nextNum).padStart(digits.length, "0");
+  return prefix + nextDigits;
+}
+
+// Makes sure every incoming customer has a code, and that none of them
+// collide with each other or with codes already in use — used when
+// importing/merging so codes from a file never overwrite/clash silently.
+function ensureUniqueCodes(existingCustomers, incomingCustomers) {
+  const used = new Set((existingCustomers || []).map((c) => c.code).filter(Boolean));
+  let counter = (existingCustomers || []).reduce((m, c) => {
+    const n = parseInt(String(c.code || "").replace(/\D/g, ""), 10);
+    return Number.isNaN(n) ? m : Math.max(m, n);
+  }, 0);
+  return incomingCustomers.map((c) => {
+    let code = (c.code || "").trim();
+    if (!code || used.has(code)) {
+      counter += 1;
+      code = "OZ-" + String(counter).padStart(4, "0");
+    }
+    used.add(code);
+    return { ...c, code };
+  });
+}
+
+function todayStart() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function parseDateOnly(str) {
+  if (!str) return null;
+  const [y, m, d] = str.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  dt.setHours(0, 0, 0, 0);
+  return dt;
+}
+
+function diffDays(a, b) {
+  return Math.round((a.getTime() - b.getTime()) / 86400000);
+}
+
+function formatDateArabic(str) {
+  const d = parseDateOnly(str);
+  if (!d) return "";
+  return `${d.getDate()} ${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+// Core status engine — computed dynamically, never frozen.
+function getVisitStatus(visit) {
+  if (visit.completed) return "done";
+  const vDate = parseDateOnly(visit.date);
+  const today = todayStart();
+  if (vDate >= today) return "upcoming";
+  return "overdue";
+}
+
+function getRelativeUpcomingLabel(visit) {
+  const vDate = parseDateOnly(visit.date);
+  const today = todayStart();
+  const diff = diffDays(vDate, today);
+  if (diff === 0) return "اليوم";
+  if (diff === 1) return "غدًا";
+  if (diff === 2) return "بعد يومين";
+  return `بعد ${diff} أيام`;
+}
+
+function getRelativeOverdueLabel(visit) {
+  const vDate = parseDateOnly(visit.date);
+  const today = todayStart();
+  const diff = diffDays(today, vDate);
+  if (diff === 1) return "متأخرة منذ يوم";
+  if (diff === 2) return "متأخرة منذ يومين";
+  return `متأخرة منذ ${diff} يوم`;
+}
+
+function isOverdueLikeGivenDraft(dateStr, completed) {
+  if (!dateStr || completed) return false;
+  const vDate = parseDateOnly(dateStr);
+  const today = todayStart();
+  return vDate < today;
+}
+
+function formatCandles(candles) {
+  if (!candles || candles.length === 0) return "—";
+  return [...candles].sort((a, b) => a - b).join("، ");
+}
+
+function money(n) {
+  const num = Number(n) || 0;
+  return num.toLocaleString("ar-EG") + " جنيه";
+}
+
+const MAIN_ACCOUNT_ID = "main";
+
+// A customer can have more than one filter/device. The MAIN account is the
+// customer's own top-level fields (deviceType, address, purchaseDate,
+// technician, visits) — so all existing data keeps working untouched. Extra
+// accounts live in customer.accounts, each with the same fields + its own visits.
+function getCustomerAccounts(customer) {
+  const main = {
+    id: MAIN_ACCOUNT_ID,
+    isMain: true,
+    label: "الحساب الأساسي",
+    address: customer.address || "",
+    deviceType: customer.deviceType || "",
+    purchaseDate: customer.purchaseDate || "",
+    technician: customer.technician || "",
+    visits: customer.visits || [],
+  };
+  const extras = (customer.accounts || []).map((a, i) => ({
+    ...a,
+    isMain: false,
+    label: (a.label || "").trim() || `الحساب ${i + 2}`,
+    visits: a.visits || [],
+  }));
+  return [main, ...extras];
+}
+
+// Every visit of the customer, across the main account and all extra accounts.
+function customerAllVisits(customer) {
+  const out = [...(customer.visits || [])];
+  for (const a of customer.accounts || []) out.push(...(a.visits || []));
+  return out;
+}
+
+// Flatten all visits across customers with a back-reference to the customer
+// and to the account (main or extra) the visit belongs to.
+function allVisits(customers) {
+  const out = [];
+  for (const c of customers) {
+    for (const acc of getCustomerAccounts(c)) {
+      for (const v of acc.visits) {
+        out.push({
+          ...v,
+          customer: c,
+          accountId: acc.id,
+          accountLabel: acc.label,
+          accountIsMain: acc.isMain,
+          accountDeviceType: acc.deviceType,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// Applies fn to the visits array of one account (main or extra) of a customer.
+function mapAccountVisits(customer, accountId, fn) {
+  if (accountId === MAIN_ACCOUNT_ID) return { ...customer, visits: fn(customer.visits || []) };
+  return {
+    ...customer,
+    accounts: (customer.accounts || []).map((a) => (a.id === accountId ? { ...a, visits: fn(a.visits || []) } : a)),
+  };
+}
+
+// Returns null if the phone is empty or a valid 11-digit Egyptian number
+// (01xxxxxxxxx). Otherwise returns a short Arabic message describing the
+// problem, so both new entries and old imported data can be flagged.
+function phoneValidationMessage(phone) {
+  const raw = (phone || "").trim();
+  if (!raw) return null;
+  const digits = raw.replace(/[^0-9]/g, "");
+  if (digits.length < 11) return "الرقم ناقص - لازم يكون 11 رقم";
+  if (digits.length > 11) return "الرقم زيادة - لازم يكون 11 رقم";
+  if (!digits.startsWith("01")) return "الرقم غير صحيح - لازم يبدأ بـ01";
+  return null;
+}
+
+function customerHasPhoneIssue(customer) {
+  return !!(phoneValidationMessage(customer.phone) || phoneValidationMessage(customer.phone2));
+}
+
+function customerBadges(customer) {
+  const visits = customerAllVisits(customer);
+  const badges = [];
+  if (customerHasPhoneIssue(customer)) badges.push({ text: "الرقم محتاج تعديل", tone: "overdue" });
+  if ((customer.accounts || []).length > 0) badges.push({ text: `${customer.accounts.length + 1} حسابات`, tone: "muted" });
+  if (visits.length === 0) {
+    badges.push({ text: "لا توجد مواعيد", tone: "muted" });
+    return badges;
+  }
+  const hasOverdue = visits.some((v) => getVisitStatus(v) === "overdue");
+  const hasUpcoming = visits.some((v) => getVisitStatus(v) === "upcoming");
+  const hasRemaining = visits.some((v) => v.paymentStatus === "remaining");
+  if (hasOverdue) badges.push({ text: "صيانة متأخرة", tone: "overdue" });
+  if (hasUpcoming) badges.push({ text: "موعد قادم", tone: "upcoming" });
+  if (hasRemaining) badges.push({ text: "أقساط متبقية", tone: "remaining" });
+  return badges;
+}
+
+// A customer is "active" (نشط) if they have ANY maintenance visit dated in ACTIVE_YEAR (2026).
+// Otherwise (no visits, or none in that year) they're "inactive" (خامل).
+function isCustomerActive(customer) {
+  return customerAllVisits(customer).some((v) => {
+    const d = parseDateOnly(v.date);
+    return !!d && d.getFullYear() === ACTIVE_YEAR;
+  });
+}
+
+// Sums paid and remaining amounts across a customer's completed visits.
+// For a fully-paid visit the whole amount counts as paid; for a visit with a
+// remaining balance, only (amount - remainingAmount) counts as paid so far.
+function visitsMoneyTotals(visitsList) {
+  const visits = visitsList.filter((v) => v.completed);
+  let paid = 0;
+  let remaining = 0;
+  for (const v of visits) {
+    const amount = Number(v.amount) || 0;
+    if (v.paymentStatus === "remaining") {
+      const rem = Number(v.remainingAmount) || 0;
+      remaining += rem;
+      paid += Math.max(amount - rem, 0);
+    } else {
+      paid += amount;
+    }
+  }
+  return { paid, remaining };
+}
+
+// Totals across all of the customer's accounts (main + extra).
+function customerMoneyTotals(customer) {
+  return visitsMoneyTotals(customerAllVisits(customer));
+}
+
+/* ============================== CENTERS ============================== */
+
+const ACTIVE_YEAR = 2026;
+const CENTERS_KEY = "ozon_crm_centers_v1";
+const UNCLASSIFIED = "?";
+const DEFAULT_CENTERS = [
+  { letter: "A", name: "سوهاج" }, { letter: "B", name: "المنشاة" }, { letter: "C", name: "الكوامل" },
+  { letter: "D", name: "الصلعا" }, { letter: "E", name: "الشرق" }, { letter: "F", name: "العسيرات" },
+  { letter: "G", name: "الحرجة" }, { letter: "H", name: "جرجا" }, { letter: "I", name: "البلينا" },
+  { letter: "J", name: "دار السلام" },
+];
+
+function customerCenterLetter(c) {
+  const m = String(c.code || "").match(/^\s*([A-Za-z])\s*[-_]?\s*\d/);
+  return m ? m[1].toUpperCase() : UNCLASSIFIED;
+}
+function centerKey(c, centers) {
+  const l = customerCenterLetter(c);
+  return centers.some((x) => x.letter === l) ? l : UNCLASSIFIED;
+}
+function codeNumber(c) {
+  const n = parseInt(String(c.code || "").replace(/\D/g, ""), 10);
+  return Number.isNaN(n) ? 0 : n;
+}
+function nextCodeForCenter(customers, letter) {
+  let max = 0;
+  for (const c of customers) if (customerCenterLetter(c) === letter) max = Math.max(max, codeNumber(c));
+  return `${letter}-${max + 1}`;
+}
+function nextFreeLetter(centers) {
+  const used = new Set(centers.map((c) => c.letter));
+  for (let i = 65; i <= 90; i++) if (!used.has(String.fromCharCode(i))) return String.fromCharCode(i);
+  return "";
+}
+
+/* ============================== EXCEL EXPORT / IMPORT ============================== */
+
+function exportCustomersToExcel(customers) {
+  const customerRows = customers.map((c) => ({
+    "معرف العميل": c.id,
+    "كود العميل": c.code || "",
+    "الاسم": c.name || "",
+    "الهاتف": c.phone || "",
+    "هاتف آخر": c.phone2 || "",
+    "العنوان": c.address || "",
+    "نوع الجهاز": c.deviceType || "",
+    "تاريخ الشراء": c.purchaseDate || "",
+    "فني المتابعة": c.technician || "",
+  }));
+
+  const accountRows = [];
+  const visitRows = [];
+  for (const c of customers) {
+    for (const acc of getCustomerAccounts(c)) {
+      if (!acc.isMain) {
+        accountRows.push({
+          "معرف الحساب": acc.id,
+          "معرف العميل": c.id,
+          "اسم العميل": c.name || "",
+          "اسم الحساب": (c.accounts || []).find((x) => x.id === acc.id)?.label || "",
+          "العنوان": acc.address || "",
+          "نوع الجهاز": acc.deviceType || "",
+          "تاريخ الشراء": acc.purchaseDate || "",
+          "فني المتابعة": acc.technician || "",
+        });
+      }
+      for (const v of acc.visits) {
+        visitRows.push({
+          "معرف الموعد": v.id,
+          "معرف العميل": c.id,
+          "اسم العميل": c.name || "",
+          "معرف الحساب": acc.isMain ? "" : acc.id,
+          "الحساب": acc.label,
+          "التاريخ": v.date || "",
+          "تمت؟": v.completed ? "نعم" : "لا",
+          "الشموع": v.completed ? (v.candles || []).join("، ") : "",
+          "المبلغ": v.completed ? (v.amount || "") : "",
+          "قطع غيار": v.completed ? (v.spareParts || "") : "",
+          "حالة الدفع": v.completed ? (v.paymentStatus === "remaining" ? "متبقي" : "مدفوع بالكامل") : "",
+          "المبلغ المتبقي": v.completed ? (v.remainingAmount || "") : "",
+          "سبب التأخير": v.delayReason || "",
+        });
+      }
+    }
+  }
+
+  const wb = XLSX.utils.book_new();
+  const wsCustomers = XLSX.utils.json_to_sheet(customerRows);
+  const wsVisits = XLSX.utils.json_to_sheet(visitRows);
+  XLSX.utils.book_append_sheet(wb, wsCustomers, "العملاء");
+  XLSX.utils.book_append_sheet(wb, wsVisits, "مواعيد الصيانة");
+  if (accountRows.length > 0) {
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(accountRows), "الحسابات الإضافية");
+  }
+
+  const dateStr = new Date().toISOString().slice(0, 10);
+  XLSX.writeFile(wb, `عملاء-أوزون-${dateStr}.xlsx`);
+}
+
+/* ============================== JSON EXPORT / IMPORT ============================== */
+// Full-fidelity backup/restore — unlike the Excel export, this keeps the exact
+// data structure (candles arrays, ids, etc.) with nothing flattened or lost.
+
+function exportCustomersToJSON(customers) {
+  const payload = {
+    app: "ozon-crm",
+    exportedAt: new Date().toISOString(),
+    customers,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `عملاء-أوزون-${dateStr}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function importCustomersFromJSON(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(e.target.result);
+        const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed.customers) ? parsed.customers : null;
+        if (!list) {
+          reject(new Error("invalid format"));
+          return;
+        }
+        // Re-generate ids so imported data never collides with what's already stored.
+        const mapVisits = (list) => (Array.isArray(list) ? list : []).map((v) => ({
+          id: uid(),
+          date: String(v.date || ""),
+          completed: !!v.completed,
+          candles: Array.isArray(v.candles) ? v.candles.filter((n) => Number.isFinite(Number(n))) : [],
+          amount: v.amount || "",
+          paymentStatus: v.paymentStatus === "remaining" ? "remaining" : "full",
+          remainingAmount: v.remainingAmount || "",
+          spareParts: String(v.spareParts || ""),
+          delayReason: String(v.delayReason || ""),
+        }));
+        const idMap = {};
+        const newCustomers = list
+          .filter((c) => c && String(c.name || "").trim())
+          .map((c) => {
+            const newId = uid();
+            if (c.id) idMap[c.id] = newId;
+            return {
+              id: newId,
+              code: String(c.code || ""),
+              name: String(c.name || "").trim(),
+              phone: String(c.phone || ""),
+              phone2: String(c.phone2 || ""),
+              address: String(c.address || ""),
+              deviceType: String(c.deviceType || ""),
+              purchaseDate: String(c.purchaseDate || ""),
+              technician: String(c.technician || ""),
+              visits: mapVisits(c.visits),
+              accounts: (Array.isArray(c.accounts) ? c.accounts : []).map((a) => ({
+                id: uid(),
+                label: String(a.label || ""),
+                address: String(a.address || ""),
+                deviceType: String(a.deviceType || ""),
+                purchaseDate: String(a.purchaseDate || ""),
+                technician: String(a.technician || ""),
+                visits: mapVisits(a.visits),
+              })),
+            };
+          });
+        resolve(newCustomers);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(new Error("read error"));
+    reader.readAsText(file);
+  });
+}
+
+
+/* ============================== EXCEL IMPORT ============================== */
+
+function importCustomersFromExcel(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb = XLSX.read(data, { type: "array" });
+
+        const customersSheetName = wb.SheetNames.find((n) => n.includes("عملاء") || n.toLowerCase().includes("customer")) || wb.SheetNames[0];
+        const visitsSheetName = wb.SheetNames.find((n) => n.includes("صيانة") || n.toLowerCase().includes("visit"));
+
+        const customerRows = XLSX.utils.sheet_to_json(wb.Sheets[customersSheetName], { defval: "" });
+        const visitRows = visitsSheetName ? XLSX.utils.sheet_to_json(wb.Sheets[visitsSheetName], { defval: "" }) : [];
+
+        const idMap = {}; // old customer id (from file) -> new generated id
+        const newCustomers = customerRows
+          .filter((r) => (r["الاسم"] || "").toString().trim())
+          .map((r) => {
+            const oldId = String(r["معرف العميل"] || "");
+            const newId = uid();
+            if (oldId) idMap[oldId] = newId;
+            return {
+              id: newId,
+              code: String(r["كود العميل"] || ""),
+              name: String(r["الاسم"] || "").trim(),
+              phone: String(r["الهاتف"] || ""),
+              phone2: String(r["هاتف آخر"] || ""),
+              address: String(r["العنوان"] || ""),
+              deviceType: String(r["نوع الجهاز"] || ""),
+              purchaseDate: String(r["تاريخ الشراء"] || ""),
+              technician: String(r["فني المتابعة"] || ""),
+              visits: [],
+              accounts: [],
+            };
+          });
+
+        const byId = {};
+        for (const c of newCustomers) byId[c.id] = c;
+
+        // Extra accounts (second filter etc.) — optional sheet, older files don't have it.
+        const accountsSheetName = wb.SheetNames.find((n) => n.includes("حسابات"));
+        const accountRows = accountsSheetName ? XLSX.utils.sheet_to_json(wb.Sheets[accountsSheetName], { defval: "" }) : [];
+        const accByOldId = {};
+        for (const r of accountRows) {
+          const owner = byId[idMap[String(r["معرف العميل"] || "")]];
+          if (!owner) continue;
+          const acc = {
+            id: uid(),
+            label: String(r["اسم الحساب"] || ""),
+            address: String(r["العنوان"] || ""),
+            deviceType: String(r["نوع الجهاز"] || ""),
+            purchaseDate: String(r["تاريخ الشراء"] || ""),
+            technician: String(r["فني المتابعة"] || ""),
+            visits: [],
+          };
+          owner.accounts.push(acc);
+          const oldAccId = String(r["معرف الحساب"] || "");
+          if (oldAccId) accByOldId[oldAccId] = acc;
+        }
+
+        for (const r of visitRows) {
+          const oldCustomerId = String(r["معرف العميل"] || "");
+          const targetId = idMap[oldCustomerId];
+          const target = targetId ? byId[targetId] : null;
+          if (!target) continue;
+          const candlesStr = String(r["الشموع"] || "");
+          const candles = candlesStr
+            .split(/[،,]/)
+            .map((s) => Number(s.trim()))
+            .filter((n) => !Number.isNaN(n) && n > 0);
+          (accByOldId[String(r["معرف الحساب"] || "")]?.visits || target.visits).push({
+            id: uid(),
+            date: String(r["التاريخ"] || ""),
+            completed: String(r["تمت؟"] || "").trim() === "نعم",
+            candles,
+            amount: r["المبلغ"] || "",
+            spareParts: String(r["قطع غيار"] || ""),
+            paymentStatus: String(r["حالة الدفع"] || "").includes("متبقي") ? "remaining" : "full",
+            remainingAmount: r["المبلغ المتبقي"] || "",
+            delayReason: String(r["سبب التأخير"] || ""),
+          });
+        }
+
+        resolve(newCustomers);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(new Error("تعذرت قراءة الملف"));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/* ============================== STYLES ============================== */
+
+const GlobalStyles = () => (
+  <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@500;600;700;800&family=Tajawal:wght@400;500;700&display=swap');
+
+    .ozon-root {
+      /* ===== OZON DESIGN TOKENS — single source of truth for every color ===== */
+      /* Ink (deep teal-navy) — dark surfaces */
+      --ink-900: #0A2A2F;
+      --ink-800: #0F3A41;
+      --ink-700: #154A52;
+      /* Brand teal */
+      --primary: #0F7F89;
+      --primary-dark: #0B6670;
+      --primary-soft: rgba(15, 127, 137, 0.10);
+      --teal-300: #6FD3CC;
+      /* Champagne gold accent (used sparingly) */
+      --accent: #C9A24D;
+      --accent-hover: #D8B561;
+      /* Neutrals (cool, slightly teal-tinted) */
+      --bg: #F3F7F7;
+      --bg-elevated: #FFFFFF;
+      --surface: #FFFFFF;
+      --surface-2: #EDF3F3;
+      --border: #D3E0E0;
+      --border-soft: #E3ECEC;
+      --text: #0E2A2F;
+      --text-muted: #51696D;
+      --text-faint: #7F9598;
+      --row-hover: rgba(15, 127, 137, 0.05);
+      /* Status */
+      --done: #2E8B6A;
+      --done-soft: rgba(46, 139, 106, 0.11);
+      --upcoming: #2D7FA8;
+      --upcoming-soft: rgba(45, 127, 168, 0.11);
+      --overdue: #BE4A55;
+      --overdue-soft: rgba(190, 74, 85, 0.10);
+      --overdue-soft-hover: rgba(190, 74, 85, 0.18);
+      --overdue-line: rgba(190, 74, 85, 0.30);
+      --amber: #A9741F;
+      --amber-soft: rgba(169, 116, 31, 0.12);
+      --done-line: rgba(46, 139, 106, 0.30);
+      --upcoming-line: rgba(45, 127, 168, 0.30);
+      --amber-line: rgba(169, 116, 31, 0.30);
+      /* Status colors readable on dark surfaces */
+      --done-on-dark: #8ED3B5;
+      --overdue-on-dark: #F0A3AA;
+      --amber-on-dark: #E8C57F;
+      /* On-dark foreground */
+      --on-dark: #FFFFFF;
+      --on-dark-muted: rgba(255, 255, 255, 0.72);
+      --on-dark-surface: rgba(255, 255, 255, 0.09);
+      --on-dark-line: rgba(255, 255, 255, 0.16);
+      /* Elevation & overlay */
+      --grad-dark: linear-gradient(135deg, var(--ink-900) 0%, var(--ink-700) 100%);
+      --shadow-sm: 0 1px 2px rgba(10, 42, 47, 0.06), 0 4px 12px rgba(10, 42, 47, 0.05);
+      --shadow-md: 0 10px 28px rgba(10, 42, 47, 0.14);
+      --overlay: rgba(10, 42, 47, 0.55);
+
+      color-scheme: light;
+      font-family: 'Tajawal', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      direction: rtl;
+      min-height: 100vh;
+      width: 100%;
+      position: relative;
+      overflow-x: hidden;
+    }
+    .ozon-root * { box-sizing: border-box; }
+    .ozon-root h1, .ozon-root h2, .ozon-root h3, .ozon-root .font-display {
+      font-family: 'Cairo', sans-serif;
+    }
+    .ozon-root ::-webkit-scrollbar { width: 8px; height: 8px; }
+    .ozon-root ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+    .ozon-root button { font-family: inherit; cursor: pointer; }
+    .ozon-root input, .ozon-root select, .ozon-root textarea { font-family: inherit; }
+    .ozon-root a { color: inherit; }
+    .ozon-root :focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+
+    .ozon-waves {
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 280px;
+      overflow: hidden;
+      pointer-events: none;
+      opacity: 1;
+      z-index: 0;
+    }
+    .ozon-waves svg { width: 100%; height: 100%; }
+    .ozon-wave-path {
+      animation: ozon-wave-drift 22s ease-in-out infinite;
+      transform-origin: center;
+    }
+    .ozon-wave-path.delay2 { animation-delay: -7s; animation-duration: 26s; }
+    .ozon-wave-path.delay3 { animation-delay: -14s; animation-duration: 30s; }
+    @keyframes ozon-wave-drift {
+      0%, 100% { transform: translateX(0) scaleY(1); }
+      50% { transform: translateX(-2.5%) scaleY(1.08); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .ozon-wave-path { animation: none !important; }
+      .ozon-root * { transition: none !important; animation: none !important; }
+    }
+
+    .container { position: relative; z-index: 1; max-width: 1180px; margin: 0 auto; padding: 24px 20px 80px; }
+
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 44px; height: 44px; border-radius: 13px;
+      background: var(--accent); color: var(--ink-900);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: var(--shadow-sm);
+      flex-shrink: 0;
+    }
+    .brand-text h1 { font-size: 19px; font-weight: 800; margin: 0; letter-spacing: 0.2px; }
+    .brand-text span { font-size: 12.5px; color: var(--text-muted); }
+
+    .nav-tabs { display: flex; gap: 6px; background: var(--surface); border: 1px solid var(--border-soft); padding: 5px; border-radius: 13px; }
+    .nav-tab {
+      display: flex; align-items: center; gap: 7px; padding: 9px 16px; border-radius: 9px;
+      background: transparent; border: none; color: var(--text-muted); font-size: 14px; font-weight: 700;
+      transition: all 0.18s ease;
+    }
+    .nav-tab.active { background: var(--primary-soft); color: var(--primary); }
+    .nav-tab:hover:not(.active) { color: var(--text); background: var(--surface-2); }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 11px;
+      border: none; font-size: 14.5px; font-weight: 700; transition: all 0.15s ease; white-space: nowrap;
+    }
+    .btn-primary { background: var(--primary); color: var(--on-dark); box-shadow: var(--shadow-sm); }
+    .btn-primary:hover { background: var(--primary-dark); transform: translateY(-1px); }
+    .btn-primary:active, .btn-ghost:active, .btn-danger:active { transform: translateY(0); }
+    .btn-ghost { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+    .btn-ghost:hover { background: var(--border-soft); }
+    .btn-danger { background: var(--overdue-soft); color: var(--overdue); border: 1px solid var(--overdue-line); }
+    .btn-danger:hover { background: var(--overdue-soft-hover); }
+    .btn-sm { padding: 7px 12px; font-size: 13px; border-radius: 9px; }
+    .btn-icon { padding: 9px; border-radius: 9px; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
+
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 22px; }
+    .kpi-card {
+      box-shadow: var(--shadow-sm);
+      background: var(--surface); border: 1px solid var(--border-soft); border-radius: 16px; padding: 18px;
+      position: relative; overflow: hidden; transition: transform 0.18s ease, border-color 0.18s ease;
+    }
+    .kpi-card:hover { transform: translateY(-2px); border-color: var(--border); }
+    .kpi-card .kpi-icon {
+      width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 12px;
+    }
+    .kpi-value { font-family: 'Cairo', sans-serif; font-size: 26px; font-weight: 800; line-height: 1; margin-bottom: 5px; }
+    .kpi-label { font-size: 13px; color: var(--text-muted); font-weight: 500; }
+
+    .alerts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 22px; }
+    .alert { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-radius: 12px; font-size: 13.5px; font-weight: 600; border: 1px solid; }
+    .alert-overdue { background: var(--overdue-soft); color: var(--overdue); border-color: var(--overdue-line); }
+    .alert-upcoming { background: var(--upcoming-soft); color: var(--upcoming); border-color: var(--upcoming-line); }
+    .alert-amber { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-line); }
+
+    .section-title { display: flex; align-items: center; justify-content: space-between; margin: 30px 0 14px; }
+    .section-title h2 { font-size: 16.5px; font-weight: 800; margin: 0; display: flex; align-items: center; gap: 9px; }
+    .section-title .count-pill { background: var(--surface-2); color: var(--text-muted); font-size: 12px; padding: 2px 9px; border-radius: 20px; font-weight: 700; }
+
+    .search-row { display: flex; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+    .search-box { position: relative; flex: 1; min-width: 240px; }
+    .search-box input {
+      width: 100%; background: var(--surface); border: 1px solid var(--border-soft); border-radius: 12px;
+      padding: 12px 44px 12px 14px; color: var(--text); font-size: 14px; transition: border-color 0.15s ease;
+    }
+    .search-box input:focus { border-color: var(--primary); }
+    .search-box input::placeholder { color: var(--text-faint); }
+    .search-box svg { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); color: var(--text-faint); }
+
+    .status-tabs { display: flex; gap: 6px; background: var(--surface); border: 1px solid var(--border-soft); padding: 5px; border-radius: 13px; flex-wrap: wrap; }
+    .status-tab {
+      display: flex; align-items: center; gap: 7px; padding: 8px 14px; border-radius: 9px;
+      background: transparent; border: none; color: var(--text-muted); font-size: 13.5px; font-weight: 700;
+      transition: all 0.18s ease; white-space: nowrap;
+    }
+    .status-tab:hover:not(.active) { color: var(--text); background: var(--surface-2); }
+    .status-tab.active { background: var(--primary-soft); color: var(--primary); }
+    .status-tab-active.active { background: var(--done-soft); color: var(--done); }
+    .status-tab-inactive.active { background: var(--overdue-soft); color: var(--overdue); }
+    .status-tab-count { background: var(--primary-soft); padding: 1px 8px; border-radius: 20px; font-size: 11px; }
+
+    .customer-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+    .customer-card {
+      box-shadow: var(--shadow-sm);
+      background: var(--surface); border: 1px solid var(--border-soft); border-radius: 16px; padding: 18px;
+      transition: transform 0.16s ease, border-color 0.16s ease; text-align: right;
+    }
+    .customer-card:hover { transform: translateY(-2px); border-color: var(--primary); cursor: pointer; }
+    .cc-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+    .cc-name { font-family: 'Cairo', sans-serif; font-size: 16px; font-weight: 700; margin: 0 0 2px; }
+    .cc-device { font-size: 12.5px; color: var(--primary); font-weight: 600; }
+    .cc-avatar {
+      width: 40px; height: 40px; border-radius: 11px; background: var(--surface-2); display: flex; align-items: center;
+      justify-content: center; color: var(--text-muted); flex-shrink: 0;
+    }
+    .cc-meta { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+    .cc-meta div { display: flex; align-items: center; gap: 7px; }
+    .cc-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 700; }
+    .badge-done { background: var(--done-soft); color: var(--done); }
+    .badge-upcoming { background: var(--upcoming-soft); color: var(--upcoming); }
+    .badge-overdue { background: var(--overdue-soft); color: var(--overdue); }
+    .badge-remaining { background: var(--amber-soft); color: var(--amber); }
+    .badge-muted { background: var(--surface-2); color: var(--text-faint); }
+
+    .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
+    .empty-state svg { color: var(--text-faint); margin-bottom: 14px; }
+    .empty-state h3 { font-family: 'Cairo', sans-serif; font-size: 16px; color: var(--text); margin: 0 0 6px; }
+    .empty-state p { font-size: 13.5px; margin: 0; }
+
+    .modal-overlay {
+      position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px);
+      display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px;
+      animation: ozon-fade-in 0.15s ease;
+    }
+    @keyframes ozon-fade-in { from { opacity: 0; } to { opacity: 1; } }
+    .modal-card {
+      background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 18px; padding: 24px;
+      width: 100%; max-width: 520px; max-height: 88vh; overflow-y: auto;
+      animation: ozon-pop-in 0.18s ease;
+    }
+    @keyframes ozon-pop-in { from { opacity: 0; transform: scale(0.97) translateY(6px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+    .modal-card.narrow { max-width: 420px; }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+    .modal-head h3 { font-size: 17px; font-weight: 800; margin: 0; }
+    .modal-close { background: var(--surface-2); border: none; border-radius: 9px; padding: 7px; color: var(--text-muted); }
+    .modal-close:hover { color: var(--text); }
+
+    .form-group { margin-bottom: 15px; }
+    .form-group label { display: block; font-size: 13px; font-weight: 700; color: var(--text-muted); margin-bottom: 7px; }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .form-control {
+      width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 13px; color: var(--text); font-size: 14px; transition: border-color 0.15s ease;
+    }
+    .form-control:focus { border-color: var(--primary); }
+    select.form-control { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%2351696d' stroke-width='1.5' fill='none'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: left 13px center; }
+
+    .dropdown { position: relative; width: 100%; }
+    .dropdown-toggle {
+      width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 13px; color: var(--text); font-size: 14px; font-family: inherit;
+      cursor: pointer; transition: border-color 0.15s ease;
+    }
+    .dropdown-toggle:hover, .dropdown-toggle:focus { border-color: var(--primary); outline: none; }
+    .dropdown-menu {
+      position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 40;
+      background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+      padding: 6px; max-height: 260px; overflow-y: auto; box-shadow: var(--shadow-md);
+    }
+    .dropdown-item {
+      padding: 9px 11px; border-radius: 8px; font-size: 13.5px; font-weight: 600;
+      color: var(--text); cursor: pointer; transition: background 0.12s ease;
+    }
+    .dropdown-item:hover { background: var(--row-hover); }
+    .dropdown-item.selected { background: var(--primary-soft); color: var(--primary); }
+
+    .checkbox-row { display: flex; align-items: center; gap: 9px; cursor: pointer; padding: 11px 13px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+    .checkbox-row input { width: 17px; height: 17px; accent-color: var(--primary); cursor: pointer; }
+    .checkbox-row span { font-size: 13.5px; font-weight: 600; }
+
+    .candle-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+    .candle-chip {
+      width: 42px; height: 42px; border-radius: 10px; border: 1.5px solid var(--border); background: var(--surface);
+      color: var(--text-muted); font-weight: 800; font-size: 14.5px; display: flex; align-items: center; justify-content: center;
+      transition: all 0.14s ease;
+    }
+    .candle-chip.selected { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); }
+    .candle-chip:hover:not(.selected) { border-color: var(--text-faint); }
+
+    .modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+    .modal-actions .btn { flex: 1; justify-content: center; }
+
+    .delay-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .delay-chip { padding: 6px 11px; border-radius: 20px; font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-muted); }
+    .delay-chip:hover { color: var(--text); border-color: var(--text-faint); }
+
+    .toast-stack { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 200; display: flex; flex-direction: column; gap: 8px; align-items: center; width: 100%; padding: 0 16px; }
+    .toast {
+      display: flex; align-items: center; gap: 9px; background: var(--bg-elevated); border: 1px solid var(--border);
+      padding: 12px 18px; border-radius: 12px; font-size: 13.5px; font-weight: 600; box-shadow: var(--shadow-md);
+      animation: ozon-toast-in 0.2s ease; max-width: 420px;
+    }
+    .toast.success { border-color: var(--done-line); color: var(--done); }
+    .toast.error { border-color: var(--overdue-line); color: var(--overdue); }
+    @keyframes ozon-toast-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+    .detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+    .back-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); background: none; border: none; font-size: 13.5px; font-weight: 700; margin-bottom: 14px; }
+    .back-btn:hover { color: var(--primary); }
+    .info-card { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 16px; padding: 20px; }
+    .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-top: 16px; }
+    .info-item label { display: block; font-size: 12px; color: var(--text-faint); font-weight: 600; margin-bottom: 4px; }
+    .info-item div { font-size: 14.5px; font-weight: 600; }
+    .action-row { display: flex; gap: 8px; }
+    .acct-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 22px 0 12px; }
+    .acct-tabs { display: flex; gap: 6px; background: var(--surface); border: 1px solid var(--border-soft); padding: 5px; border-radius: 13px; flex-wrap: wrap; }
+    .acct-tab {
+      display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border-radius: 9px; cursor: pointer;
+      background: transparent; border: none; color: var(--text-muted); font-size: 13.5px; font-weight: 700; font-family: inherit;
+    }
+    .acct-tab:hover:not(.active) { color: var(--text); background: var(--surface-2); }
+    .acct-tab.active { background: var(--primary-soft); color: var(--primary); }
+
+    .table-wrap { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 16px; overflow: hidden; }
+    table.visits-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+    table.visits-table th { text-align: right; padding: 13px 16px; background: var(--surface-2); color: var(--text-muted); font-weight: 700; font-size: 12.5px; white-space: nowrap; }
+    table.visits-table td { padding: 13px 16px; border-top: 1px solid var(--border-soft); vertical-align: top; }
+    table.visits-table tr:hover td { background: var(--row-hover); }
+    .row-actions { display: flex; gap: 6px; }
+    .status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border-radius: 20px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+
+    .maint-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+    .maint-col { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 16px; padding: 16px; }
+    .maint-col-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; font-weight: 800; font-size: 14.5px; }
+    .maint-item { padding: 12px; border-radius: 12px; background: var(--surface-2); margin-bottom: 8px; transition: background 0.15s ease; }
+    .maint-item:hover { background: var(--border-soft); cursor: pointer; }
+    .maint-item-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+    .maint-item-name { font-weight: 700; font-size: 13.5px; }
+    .maint-item-meta { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+    .maint-item-reason { font-size: 11.5px; color: var(--overdue); margin-top: 5px; }
+
+    .month-select { min-width: 160px; }
+
+    /* ===== Home / centers components + dark surfaces (tokens only) ===== */
+    .topbar { background: var(--grad-dark); border-radius: 18px; padding: 14px 18px; box-shadow: var(--shadow-md); }
+    .brand-text h1 { color: var(--on-dark); }
+    .brand-text span { color: var(--on-dark-muted); }
+    .nav-tabs { background: var(--on-dark-surface); border-color: var(--on-dark-line); }
+    .nav-tab { color: var(--on-dark-muted); }
+    .nav-tab:hover:not(.active) { background: var(--on-dark-line); color: var(--on-dark); }
+    .nav-tab.active { background: var(--accent); color: var(--ink-900); }
+    .topbar .btn-ghost { background: var(--on-dark-surface); color: var(--on-dark); border-color: var(--on-dark-line); }
+    .topbar .btn-ghost:hover { background: var(--on-dark-line); }
+    .topbar :focus-visible, .hero :focus-visible, .center-head :focus-visible, .kpi-card:focus-visible { outline-color: var(--accent); }
+
+    .section-title h2 { color: var(--text); }
+    .section-title .count-pill { background: var(--ink-800); color: var(--on-dark); }
+    .back-btn { color: var(--primary-dark); }
+    .empty-state { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 16px; }
+
+    .form-control:disabled, .search-box input:disabled { background: var(--surface-2); color: var(--text-faint); cursor: not-allowed; }
+    .form-control::placeholder { color: var(--text-faint); }
+
+    .hero { background: var(--grad-dark); color: var(--on-dark); border-radius: 20px; padding: 26px 28px; display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; box-shadow: var(--shadow-md); position: relative; overflow: hidden; }
+    .hero::before { content: ""; position: absolute; width: 260px; height: 260px; border-radius: 50%; background: var(--on-dark-surface); left: -80px; top: -120px; }
+    .hero > * { position: relative; z-index: 1; }
+    .hero h2 { margin: 0 0 5px; font-size: 23px; font-weight: 800; color: var(--on-dark); }
+    .hero p { margin: 0; font-size: 14px; color: var(--on-dark-muted); }
+    .btn-white { background: var(--accent); color: var(--ink-900); box-shadow: var(--shadow-sm); }
+    .btn-white:hover { background: var(--accent-hover); transform: translateY(-1px); }
+
+    .kpi-card { background: var(--grad-dark); border-color: var(--ink-700); color: var(--on-dark); }
+    .kpi-card .kpi-icon { background: var(--on-dark-surface) !important; color: var(--teal-300) !important; }
+    .kpi-value { color: var(--on-dark); }
+    .kpi-label { color: var(--on-dark-muted); }
+    .kpi-card.clickable { cursor: pointer; }
+    .kpi-card.clickable:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
+    .kpi-card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+    .kpi-arrow { position: absolute; left: 14px; top: 16px; color: var(--on-dark-muted); }
+
+    .view-panel { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 18px; padding: 18px; margin-bottom: 22px; box-shadow: var(--shadow-sm); }
+    .view-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+    .view-panel-head h3 { margin: 0; font-size: 16px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+    .rows-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+    .rows-grid .maint-item { margin-bottom: 0; border: 1px solid var(--border-soft); }
+
+    .centers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 14px; }
+    .center-card { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 18px; padding: 18px; cursor: pointer; transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease; position: relative; overflow: hidden; box-shadow: var(--shadow-sm); }
+    .center-card::after { content: ""; position: absolute; width: 90px; height: 90px; border-radius: 50%; background: var(--primary-soft); left: -28px; bottom: -34px; }
+    .center-card:hover { transform: translateY(-3px); border-color: var(--primary); box-shadow: var(--shadow-md); }
+    .center-letter { width: 46px; height: 46px; border-radius: 13px; background: var(--ink-800); color: var(--accent); font-family: 'Cairo', sans-serif; font-weight: 800; font-size: 22px; display: flex; align-items: center; justify-content: center; }
+    .center-letter.big { width: 62px; height: 62px; font-size: 30px; border-radius: 17px; background: var(--accent); color: var(--ink-900); }
+    .center-name { font-family: 'Cairo', sans-serif; font-size: 17px; font-weight: 800; margin: 12px 0 2px; position: relative; z-index: 1; }
+    .center-count { font-size: 13px; color: var(--text-muted); position: relative; z-index: 1; }
+    .center-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; position: relative; z-index: 1; min-height: 24px; }
+    .center-card.add { border: 2px dashed var(--border); background: transparent; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--primary-dark); font-weight: 800; min-height: 150px; box-shadow: none; }
+    .center-card.add::after { display: none; }
+    .center-card.add:hover { background: var(--primary-soft); border-color: var(--primary); transform: none; box-shadow: none; }
+    .center-chip { display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 20px; background: var(--primary-soft); color: var(--primary-dark); font-size: 11.5px; font-weight: 800; }
+
+    .center-head { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; background: var(--grad-dark); color: var(--on-dark); border-radius: 20px; padding: 18px 20px; margin-bottom: 18px; box-shadow: var(--shadow-md); }
+    .center-head-info { flex: 1; min-width: 200px; }
+    .center-head-info h2 { margin: 0 0 8px; font-size: 21px; font-weight: 800; color: var(--on-dark); }
+    .center-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+    .center-head .badge { background: var(--on-dark-surface); color: var(--on-dark); }
+    .center-head .badge-done { color: var(--done-on-dark); }
+    .center-head .badge-overdue { color: var(--overdue-on-dark); }
+    .center-head .badge-remaining { color: var(--amber-on-dark); }
+
+    .filter-btn-badge { background: var(--accent); color: var(--ink-900); border-radius: 20px; font-size: 11px; padding: 1px 7px; font-weight: 800; }
+    .filter-panel { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 14px; padding: 14px; display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-top: 10px; box-shadow: var(--shadow-sm); }
+    .filter-panel .form-group { margin: 0; min-width: 150px; flex: 1; }
+
+    @media (max-width: 640px) {
+      .container { padding: 16px 12px 60px; }
+      .topbar { flex-direction: column; align-items: stretch; }
+      .nav-tabs { justify-content: stretch; }
+      .nav-tab { flex: 1; justify-content: center; }
+      .form-row { grid-template-columns: 1fr; }
+    }
+  `}</style>
+);
+
+function Waves() {
+  return (
+    <div className="ozon-waves" aria-hidden="true">
+      <svg viewBox="0 0 1200 280" preserveAspectRatio="none">
+        <path className="ozon-wave-path" d="M0,120 C200,180 400,60 600,110 C800,160 1000,60 1200,110 L1200,0 L0,0 Z" style={{ fill: "var(--primary)", fillOpacity: 0.06 }} />
+        <path className="ozon-wave-path delay2" d="M0,150 C250,90 450,190 700,140 C900,100 1050,170 1200,140 L1200,0 L0,0 Z" style={{ fill: "var(--primary)", fillOpacity: 0.06 }} />
+        <path className="ozon-wave-path delay3" d="M0,90 C300,150 500,40 800,90 C950,120 1100,70 1200,90 L1200,0 L0,0 Z" style={{ fill: "var(--primary)", fillOpacity: 0.06 }} />
+      </svg>
+    </div>
+  );
+}
+
+/* ============================== SMALL COMPONENTS ============================== */
+
+function Toast({ toast }) {
+  return (
+    <div className={`toast ${toast.type}`}>
+      {toast.type === "success" ? <CircleCheck size={17} /> : <CircleAlert size={17} />}
+      <span>{toast.message}</span>
+    </div>
+  );
+}
+
+function ConfirmModal({ title, message, confirmLabel = "تأكيد", danger = true, onConfirm, onCancel }) {
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal-card narrow" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{title}</h3>
+          <button className="modal-close" onClick={onCancel}><X size={18} /></button>
+        </div>
+        <p style={{ color: "var(--text-muted)", fontSize: 14, lineHeight: 1.7, margin: "0 0 4px" }}>{message}</p>
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onCancel}>إلغاء</button>
+          <button className={`btn ${danger ? "btn-danger" : "btn-primary"}`} onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ImportModeModal({ count, onMerge, onReplace, onCancel }) {
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal-card narrow" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>طريقة الاستيراد</h3>
+          <button className="modal-close" onClick={onCancel}><X size={18} /></button>
+        </div>
+        <p style={{ color: "var(--text-muted)", fontSize: 14, lineHeight: 1.7, margin: "0 0 4px" }}>
+          الملف بيحتوي على {count} عميل. عايز تعمل إيه بالبيانات الحالية؟
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
+          <button
+            className="btn btn-primary"
+            style={{ justifyContent: "flex-start", textAlign: "right", padding: "13px 15px", height: "auto" }}
+            onClick={onMerge}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
+              <span style={{ fontWeight: 800 }}>دمج مع البيانات الحالية</span>
+              <span style={{ fontWeight: 500, fontSize: 12.5, opacity: 0.9 }}>إضافة عملاء الملف كعملاء جدد بجانب اللي موجود بالفعل</span>
+            </div>
+          </button>
+          <button
+            className="btn btn-danger"
+            style={{ justifyContent: "flex-start", textAlign: "right", padding: "13px 15px", height: "auto" }}
+            onClick={onReplace}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
+              <span style={{ fontWeight: 800 }}>استبدال كل البيانات الحالية</span>
+              <span style={{ fontWeight: 500, fontSize: 12.5, opacity: 0.9 }}>حذف كل العملاء الموجودين دلوقتي واستخدام محتوى الملف بدالهم (رجوع لنسخة قديمة)</span>
+            </div>
+          </button>
+        </div>
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onCancel}>إلغاء</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KPICard({ icon, iconBg, iconColor, value, label, onClick, selected }) {
+  return (
+    <div className={`kpi-card ${onClick ? "clickable" : ""} ${selected ? "sel" : ""}`} onClick={onClick}>
+      <div className="kpi-icon" style={{ background: iconBg, color: iconColor }}>{icon}</div>
+      <div className="kpi-value">{value}</div>
+      <div className="kpi-label">{label}</div>
+      {onClick && <ChevronLeft size={16} className="kpi-arrow" />}
+    </div>
+  );
+}
+
+// Segmented "الكل / نشط / خامل" filter used on the customers dashboard and
+// the maintenance schedule page to filter by customer activity status.
+function StatusFilterTabs({ value, onChange, counts }) {
+  return (
+    <div className="status-tabs">
+      <button type="button" className={`status-tab ${value === "all" ? "active" : ""}`} onClick={() => onChange("all")}>
+        الكل <span className="status-tab-count">{counts.all}</span>
+      </button>
+      <button type="button" className={`status-tab status-tab-active ${value === "active" ? "active" : ""}`} onClick={() => onChange("active")}>
+        نشط <span className="status-tab-count">{counts.active}</span>
+      </button>
+      <button type="button" className={`status-tab status-tab-inactive ${value === "inactive" ? "active" : ""}`} onClick={() => onChange("inactive")}>
+        خامل <span className="status-tab-count">{counts.inactive}</span>
+      </button>
+    </div>
+  );
+}
+
+function BadgeList({ badges }) {
+  return (
+    <div className="cc-badges">
+      {badges.map((b, i) => (
+        <span key={i} className={`badge badge-${b.tone}`}>{b.text}</span>
+      ))}
+    </div>
+  );
+}
+
+function StatusPill({ visit }) {
+  const status = getVisitStatus(visit);
+  if (status === "done") return <span className="status-pill badge-done"><CircleCheck size={13} /> تمت</span>;
+  if (status === "upcoming") return <span className="status-pill badge-upcoming"><Clock size={13} /> {getRelativeUpcomingLabel(visit)}</span>;
+  return <span className="status-pill badge-overdue"><AlertTriangle size={13} /> {getRelativeOverdueLabel(visit)}</span>;
+}
+
+function CustomerCard({ customer, onClick }) {
+  const badges = customerBadges(customer);
+  const totals = customerMoneyTotals(customer);
+  return (
+    <div className="customer-card" onClick={onClick}>
+      <div className="cc-head">
+        <div>
+          <h3 className="cc-name">{customer.name}</h3>
+          <span className="cc-device">{customer.deviceType || "—"}{customer.code ? ` · ${customer.code}` : ""}</span>
+        </div>
+        <div className="cc-avatar"><User size={19} /></div>
+      </div>
+      <div className="cc-meta">
+        <div><Phone size={13} /> {customer.phone || "—"}{customer.phone2 ? ` / ${customer.phone2}` : ""}</div>
+        <div><MapPin size={13} /> {customer.address || "—"}</div>
+      </div>
+      {(totals.paid > 0 || totals.remaining > 0) && (
+        <div className="cc-meta" style={{ marginTop: 2 }}>
+          <div style={{ color: "var(--done)" }}><Coins size={13} /> مدفوع: {money(totals.paid)}</div>
+          {totals.remaining > 0 && <div style={{ color: "var(--amber)" }}><Coins size={13} /> متبقي: {money(totals.remaining)}</div>}
+        </div>
+      )}
+      <BadgeList badges={badges} />
+    </div>
+  );
+}
+
+function EmptyState({ icon, title, message }) {
+  return (
+    <div className="empty-state">
+      {icon}
+      <h3>{title}</h3>
+      <p>{message}</p>
+    </div>
+  );
+}
+
+/* ============================== CUSTOMER MODAL ============================== */
+
+function CustomerModal({ initial, suggestedCode, onSave, onClose }) {
+  const [form, setForm] = useState(
+    initial || { name: "", phone: "", phone2: "", address: "", deviceType: "", purchaseDate: "", technician: "", code: suggestedCode || "" }
+  );
+  const [error, setError] = useState("");
+  const isEdit = !!initial;
+
+  function set(field, value) {
+    setForm((f) => ({ ...f, [field]: value }));
+  }
+
+  function submit() {
+    if (!form.name.trim()) {
+      setError("اسم العميل مطلوب");
+      return;
+    }
+    const phoneMsg = phoneValidationMessage(form.phone);
+    if (phoneMsg) {
+      setError(`رقم الهاتف: ${phoneMsg}`);
+      return;
+    }
+    const phone2Msg = phoneValidationMessage(form.phone2);
+    if (phone2Msg) {
+      setError(`رقم الهاتف الآخر: ${phone2Msg}`);
+      return;
+    }
+    onSave(form);
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{isEdit ? "تعديل بيانات العميل" : "إضافة عميل جديد"}</h3>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+
+        <div className="form-group">
+          <label>اسم العميل *</label>
+          <input
+            className="form-control"
+            value={form.name}
+            onChange={(e) => { set("name", e.target.value); setError(""); }}
+            placeholder="مثال: أحمد محمد"
+          />
+          {error && <div style={{ color: "var(--overdue)", fontSize: 12.5, marginTop: 6, fontWeight: 600 }}>{error}</div>}
+        </div>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label>رقم الهاتف</label>
+            <input className="form-control" value={form.phone} onChange={(e) => set("phone", e.target.value)} placeholder="01xxxxxxxxx" />
+            {phoneValidationMessage(form.phone) && (
+              <div style={{ color: "var(--overdue)", fontSize: 12, marginTop: 4, fontWeight: 600 }}>{phoneValidationMessage(form.phone)}</div>
+            )}
+          </div>
+          <div className="form-group">
+            <label>رقم هاتف آخر (اختياري)</label>
+            <input className="form-control" value={form.phone2 || ""} onChange={(e) => set("phone2", e.target.value)} placeholder="01xxxxxxxxx" />
+            {phoneValidationMessage(form.phone2) && (
+              <div style={{ color: "var(--overdue)", fontSize: 12, marginTop: 4, fontWeight: 600 }}>{phoneValidationMessage(form.phone2)}</div>
+            )}
+          </div>
+        </div>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label>نوع الجهاز</label>
+            <input className="form-control" value={form.deviceType} onChange={(e) => set("deviceType", e.target.value)} placeholder="فلتر 5 مراحل" />
+          </div>
+          <div className="form-group">
+            <label>كود العميل</label>
+            <input className="form-control" value={form.code || ""} onChange={(e) => set("code", e.target.value)} placeholder="OZ-0001" />
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label>العنوان</label>
+          <input className="form-control" value={form.address} onChange={(e) => set("address", e.target.value)} placeholder="المدينة، الحي، الشارع" />
+        </div>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label>تاريخ الشراء</label>
+            <input type="date" className="form-control" value={form.purchaseDate} onChange={(e) => set("purchaseDate", e.target.value)} />
+          </div>
+          <div className="form-group">
+            <label>اسم فني المتابعة</label>
+            <input className="form-control" value={form.technician} onChange={(e) => set("technician", e.target.value)} placeholder="اسم الفني" />
+          </div>
+        </div>
+
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose}>إلغاء</button>
+          <button className="btn btn-primary" onClick={submit}><Check size={16} /> حفظ</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== ACCOUNT MODAL ============================== */
+// Adds/edits an extra account (e.g. a second filter) inside a customer's file.
+
+function AccountModal({ initial, defaultAddress, onSave, onClose }) {
+  const [form, setForm] = useState(
+    initial
+      ? {
+          label: initial.label || "",
+          address: initial.address || "",
+          deviceType: initial.deviceType || "",
+          purchaseDate: initial.purchaseDate || "",
+          technician: initial.technician || "",
+        }
+      : { label: "", address: defaultAddress || "", deviceType: "", purchaseDate: "", technician: "" }
+  );
+  const isEdit = !!initial;
+
+  function set(field, value) {
+    setForm((f) => ({ ...f, [field]: value }));
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{isEdit ? "تعديل الحساب" : "إضافة حساب آخر للعميل"}</h3>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+
+        <div className="form-group">
+          <label>اسم الحساب (اختياري)</label>
+          <input
+            className="form-control"
+            value={form.label}
+            onChange={(e) => set("label", e.target.value)}
+            placeholder="مثال: فلتر المطبخ / فلتر المحل"
+          />
+        </div>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label>نوع الجهاز</label>
+            <input className="form-control" value={form.deviceType} onChange={(e) => set("deviceType", e.target.value)} placeholder="فلتر 5 مراحل" />
+          </div>
+          <div className="form-group">
+            <label>تاريخ الشراء</label>
+            <input type="date" className="form-control" value={form.purchaseDate} onChange={(e) => set("purchaseDate", e.target.value)} />
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label>العنوان</label>
+          <input className="form-control" value={form.address} onChange={(e) => set("address", e.target.value)} placeholder="المدينة، الحي، الشارع" />
+        </div>
+
+        <div className="form-group">
+          <label>اسم فني المتابعة</label>
+          <input className="form-control" value={form.technician} onChange={(e) => set("technician", e.target.value)} placeholder="اسم الفني" />
+        </div>
+
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose}>إلغاء</button>
+          <button className="btn btn-primary" onClick={() => onSave(form)}><Check size={16} /> حفظ</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== VISIT MODAL ============================== */
+
+function VisitModal({ initial, onSave, onClose }) {
+  const [form, setForm] = useState(
+    initial || {
+      date: "",
+      completed: false,
+      candles: [],
+      amount: "",
+      spareParts: "",
+      paymentStatus: "full",
+      remainingAmount: "",
+      delayReason: "",
+    }
+  );
+  const [error, setError] = useState("");
+  const isEdit = !!initial;
+
+  function set(field, value) {
+    setForm((f) => ({ ...f, [field]: value }));
+  }
+
+  // Changing the date can flip whether the visit has "arrived" yet — if it moves
+  // back into the future, force-uncheck completed, since the work can't have happened yet.
+  function handleDateChange(value) {
+    setForm((f) => {
+      const d = value ? parseDateOnly(value) : null;
+      const arrived = d ? d <= todayStart() : false;
+      return { ...f, date: value, completed: arrived ? f.completed : false };
+    });
+    setError("");
+  }
+
+  function toggleCandle(n) {
+    setForm((f) => {
+      const has = f.candles.includes(n);
+      return { ...f, candles: has ? f.candles.filter((c) => c !== n) : [...f.candles, n].sort((a, b) => a - b) };
+    });
+  }
+
+  function submit() {
+    if (!form.date) {
+      setError("تاريخ الموعد مطلوب");
+      return;
+    }
+    onSave(form);
+  }
+
+  // Has the appointment date arrived (today or earlier)? Details of what actually
+  // happened during the visit only make sense once this is true.
+  const dateArrived = form.date ? parseDateOnly(form.date) <= todayStart() : false;
+  const showDelayReason = isOverdueLikeGivenDraft(form.date, form.completed);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{isEdit ? "تعديل موعد صيانة" : "إضافة موعد صيانة"}</h3>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+
+        <div className="form-group">
+          <label>تاريخ الموعد *</label>
+          <input
+            type="date"
+            className="form-control"
+            value={form.date}
+            onChange={(e) => handleDateChange(e.target.value)}
+          />
+          {error && <div style={{ color: "var(--overdue)", fontSize: 12.5, marginTop: 6, fontWeight: 600 }}>{error}</div>}
+        </div>
+
+        {dateArrived ? (
+          <label className="checkbox-row" style={{ marginBottom: 15 }}>
+            <input type="checkbox" checked={form.completed} onChange={(e) => set("completed", e.target.checked)} />
+            <span>تمت هذه الصيانة بالفعل</span>
+          </label>
+        ) : (
+          <div
+            className="checkbox-row"
+            style={{ marginBottom: 15, opacity: 0.65, cursor: "default" }}
+          >
+            <input type="checkbox" checked={false} disabled />
+            <span>هذا الموعد لسه لم يجي معاده — هيمكنك تأكيد إتمامه أو تسجيله كمتأخر عند وصول تاريخه</span>
+          </div>
+        )}
+
+        {dateArrived && form.completed && (
+          <>
+            <div className="form-group">
+              <label>الشموع التي تم تغييرها</label>
+              <div className="candle-grid">
+                {CANDLE_OPTIONS.map((n) => (
+                  <button
+                    type="button"
+                    key={n}
+                    className={`candle-chip ${form.candles.includes(n) ? "selected" : ""}`}
+                    onClick={() => toggleCandle(n)}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="form-row">
+              <div className="form-group">
+                <label>المبلغ (جنيه)</label>
+                <input type="number" className="form-control" value={form.amount} onChange={(e) => set("amount", e.target.value)} placeholder="0" />
+              </div>
+              <div className="form-group">
+                <label>حالة الدفع</label>
+                <Dropdown
+                  value={form.paymentStatus}
+                  onChange={(v) => set("paymentStatus", v)}
+                  options={[
+                    { value: "full", label: "مدفوع بالكامل" },
+                    { value: "remaining", label: "متبقي مبلغ" },
+                  ]}
+                />
+              </div>
+            </div>
+
+            {form.paymentStatus === "remaining" && (
+              <div className="form-group">
+                <label>المبلغ المتبقي بالجنيه</label>
+                <input type="number" className="form-control" value={form.remainingAmount} onChange={(e) => set("remainingAmount", e.target.value)} placeholder="0" />
+              </div>
+            )}
+
+            <div className="form-group">
+              <label>قطع غيار أخرى</label>
+              <input className="form-control" value={form.spareParts} onChange={(e) => set("spareParts", e.target.value)} placeholder="وصف مختصر (اختياري)" />
+            </div>
+          </>
+        )}
+
+        {showDelayReason && (
+          <div className="form-group">
+            <label>سبب التأخير (اختياري)</label>
+            <input className="form-control" value={form.delayReason} onChange={(e) => set("delayReason", e.target.value)} placeholder="اكتب سبب التأخير" />
+            <div className="delay-presets">
+              {DELAY_REASON_PRESETS.map((r) => (
+                <button type="button" key={r} className="delay-chip" onClick={() => set("delayReason", r)}>{r}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!dateArrived && (
+          <div
+            style={{
+              background: "var(--surface-2)",
+              border: "1px solid var(--border)",
+              borderRadius: 10,
+              padding: "12px 13px",
+              color: "var(--text-muted)",
+              fontSize: 12.5,
+              marginBottom: 15,
+              lineHeight: 1.7,
+            }}
+          >
+            هتقدر تسجل تفاصيل الصيانة (الشموع، المبلغ، قطع الغيار...) لما يجي تاريخ الموعد وتأكد إنها اتعملت.
+          </div>
+        )}
+
+        {dateArrived && !form.completed && (
+          <div
+            style={{
+              background: "var(--surface-2)",
+              border: "1px solid var(--border)",
+              borderRadius: 10,
+              padding: "12px 13px",
+              color: "var(--text-muted)",
+              fontSize: 12.5,
+              marginBottom: 15,
+              lineHeight: 1.7,
+            }}
+          >
+            تفاصيل الصيانة (الشموع، المبلغ، قطع الغيار...) هتظهر لك لما تحدد إن الصيانة تمت بالفعل.
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose}>إلغاء</button>
+          <button className="btn btn-primary" onClick={submit}><Check size={16} /> حفظ الموعد</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== DASHBOARD PAGE ============================== */
+
+function DashboardPage({ customers, onOpenCustomer, onAddCustomer, search, setSearch }) {
+  const [activityFilter, setActivityFilter] = useState("all"); // all | active | inactive
+  const visits = useMemo(() => allVisits(customers), [customers]);
+
+  const activityCounts = useMemo(() => {
+    const active = customers.filter(isCustomerActive).length;
+    return { all: customers.length, active, inactive: customers.length - active };
+  }, [customers]);
+
+  const stats = useMemo(() => {
+    const totalCustomers = customers.length;
+    const totalVisits = visits.length;
+    const overdue = visits.filter((v) => getVisitStatus(v) === "overdue");
+    const upcoming14 = visits.filter((v) => {
+      if (getVisitStatus(v) !== "upcoming") return false;
+      const d = diffDays(parseDateOnly(v.date), todayStart());
+      return d <= 14;
+    });
+    const upcoming3 = upcoming14.filter((v) => diffDays(parseDateOnly(v.date), todayStart()) <= 3);
+    const done = visits.filter((v) => getVisitStatus(v) === "done");
+    const remainingVisits = visits.filter((v) => v.paymentStatus === "remaining");
+    const remainingTotal = remainingVisits.reduce((sum, v) => sum + (Number(v.remainingAmount) || 0), 0);
+    const paidTotal = customers.reduce((sum, c) => sum + customerMoneyTotals(c).paid, 0);
+
+    return { totalCustomers, totalVisits, overdue, upcoming14, upcoming3, done, remainingVisits, remainingTotal, paidTotal };
+  }, [customers, visits]);
+
+  const nearestUpcoming = useMemo(
+    () => [...stats.upcoming14].sort((a, b) => parseDateOnly(a.date) - parseDateOnly(b.date)).slice(0, 5),
+    [stats.upcoming14]
+  );
+  const recentOverdue = useMemo(
+    () => [...stats.overdue].sort((a, b) => parseDateOnly(b.date) - parseDateOnly(a.date)).slice(0, 5),
+    [stats.overdue]
+  );
+
+  const filteredCustomers = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return customers.filter((c) => {
+      const matchesSearch =
+        !q ||
+        [c.name, c.phone, c.phone2, c.address, c.code].some((f) => (f || "").toLowerCase().includes(q)) ||
+        (c.accounts || []).some((a) => [a.address, a.label, a.deviceType].some((f) => (f || "").toLowerCase().includes(q)));
+      if (!matchesSearch) return false;
+      if (activityFilter === "active") return isCustomerActive(c);
+      if (activityFilter === "inactive") return !isCustomerActive(c);
+      return true;
+    });
+  }, [customers, search, activityFilter]);
+
+  return (
+    <div>
+      <div className="kpi-grid">
+        <KPICard icon={<Users size={19} />} iconBg="var(--primary-soft)" iconColor="var(--primary)" value={stats.totalCustomers} label="إجمالي العملاء" />
+        <KPICard icon={<AlertTriangle size={19} />} iconBg="var(--overdue-soft)" iconColor="var(--overdue)" value={stats.overdue.length} label="صيانات متأخرة" />
+        <KPICard icon={<Calendar size={19} />} iconBg="var(--upcoming-soft)" iconColor="var(--upcoming)" value={stats.upcoming14.length} label="صيانات قادمة (14 يوم)" />
+        <KPICard icon={<Coins size={19} />} iconBg="var(--amber-soft)" iconColor="var(--amber)" value={money(stats.remainingTotal)} label="مبالغ متبقية" />
+        <KPICard icon={<Coins size={19} />} iconBg="var(--done-soft)" iconColor="var(--done)" value={money(stats.paidTotal)} label="إجمالي المدفوع" />
+        <KPICard icon={<Wrench size={19} />} iconBg="var(--done-soft)" iconColor="var(--done)" value={stats.remainingVisits.length} label="زيارات غير مسددة" />
+      </div>
+
+      {(stats.overdue.length > 0 || stats.upcoming3.length > 0 || stats.remainingTotal > 0) && (
+        <div className="alerts">
+          {stats.upcoming3.length > 0 && (
+            <div className="alert alert-upcoming"><Bell size={16} /> لديك {stats.upcoming3.length} صيانات خلال الـ 3 أيام القادمة.</div>
+          )}
+          {stats.overdue.length > 0 && (
+            <div className="alert alert-overdue"><AlertTriangle size={16} /> لديك {stats.overdue.length} صيانات متأخرة تحتاج إلى متابعة.</div>
+          )}
+          {stats.remainingTotal > 0 && (
+            <div className="alert alert-amber"><Coins size={16} /> يوجد {money(stats.remainingTotal)} مبالغ مستحقة.</div>
+          )}
+        </div>
+      )}
+
+      {(nearestUpcoming.length > 0 || recentOverdue.length > 0) && (
+        <div className="maint-columns" style={{ marginBottom: 8 }}>
+          {nearestUpcoming.length > 0 && (
+            <div className="maint-col">
+              <div className="maint-col-head" style={{ color: "var(--upcoming)" }}><Clock size={16} /> أقرب مواعيد الصيانة</div>
+              {nearestUpcoming.map((v) => (
+                <div key={v.id} className="maint-item" onClick={() => onOpenCustomer(v.customer.id, v.accountId)}>
+                  <div className="maint-item-top">
+                    <span className="maint-item-name">{v.customer.name}</span>
+                    <StatusPill visit={v} />
+                  </div>
+                  <div className="maint-item-meta"><Droplets size={12} /> {v.accountDeviceType || "—"}{!v.accountIsMain && v.accountLabel ? ` (${v.accountLabel})` : ""} · {formatDateArabic(v.date)}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {recentOverdue.length > 0 && (
+            <div className="maint-col">
+              <div className="maint-col-head" style={{ color: "var(--overdue)" }}><AlertTriangle size={16} /> أحدث الصيانات المتأخرة</div>
+              {recentOverdue.map((v) => (
+                <div key={v.id} className="maint-item" onClick={() => onOpenCustomer(v.customer.id, v.accountId)}>
+                  <div className="maint-item-top">
+                    <span className="maint-item-name">{v.customer.name}</span>
+                    <StatusPill visit={v} />
+                  </div>
+                  <div className="maint-item-meta"><Droplets size={12} /> {v.accountDeviceType || "—"}{!v.accountIsMain && v.accountLabel ? ` (${v.accountLabel})` : ""} · {formatDateArabic(v.date)}</div>
+                  {v.delayReason && <div className="maint-item-reason">السبب: {v.delayReason}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="section-title">
+        <h2><Users size={17} /> العملاء <span className="count-pill">{filteredCustomers.length}</span></h2>
+        <button className="btn btn-primary" onClick={onAddCustomer}><Plus size={16} /> إضافة عميل</button>
+      </div>
+
+      <div className="search-row">
+        <div className="search-box">
+          <input placeholder="ابحث بالاسم أو الرقم أو العنوان أو الكود" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <Search size={16} />
+        </div>
+        <StatusFilterTabs value={activityFilter} onChange={setActivityFilter} counts={activityCounts} />
+      </div>
+
+      <div style={{ height: 16 }} />
+
+      {customers.length === 0 ? (
+        <EmptyState
+          icon={<Droplets size={44} />}
+          title="لا يوجد عملاء بعد"
+          message="ابدأ بإضافة أول عميل لمتابعة أجهزته ومواعيد صيانته."
+        />
+      ) : filteredCustomers.length === 0 ? (
+        <EmptyState icon={<Search size={44} />} title="لا توجد نتائج" message="جرّب كلمة بحث مختلفة." />
+      ) : (
+        <div className="customer-grid">
+          {filteredCustomers.map((c) => (
+            <CustomerCard key={c.id} customer={c} onClick={() => onOpenCustomer(c.id)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================== CUSTOMER DETAILS PAGE ============================== */
+
+function CustomerDetailsPage({
+  customer, activeAccountId, onSelectAccount, onBack, onEditCustomer, onDeleteCustomer,
+  onAddAccount, onEditAccount, onDeleteAccount, onAddVisit, onEditVisit, onDeleteVisit,
+}) {
+  const accounts = useMemo(() => getCustomerAccounts(customer), [customer]);
+  const account = accounts.find((a) => a.id === activeAccountId) || accounts[0];
+  const hasMany = accounts.length > 1;
+  const visits = useMemo(
+    () => [...account.visits].sort((a, b) => parseDateOnly(b.date) - parseDateOnly(a.date)),
+    [account]
+  );
+  const totals = useMemo(() => customerMoneyTotals(customer), [customer]);
+  const accountTotals = useMemo(() => visitsMoneyTotals(account.visits), [account]);
+
+  return (
+    <div>
+      <button className="back-btn" onClick={onBack}><ArrowRight size={15} /> رجوع إلى العملاء</button>
+
+      <div className="detail-header">
+        <div className="info-card" style={{ flex: 1, minWidth: 280 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div className="cc-avatar" style={{ width: 48, height: 48 }}><User size={22} /></div>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 19, fontWeight: 800 }}>{customer.name}</h2>
+                <span style={{ color: "var(--primary)", fontSize: 13, fontWeight: 600 }}>{customer.deviceType || "—"}{customer.code ? ` · ${customer.code}` : ""}</span>
+              </div>
+            </div>
+            <div className="action-row">
+              <button className="btn btn-ghost btn-sm" onClick={onEditCustomer}><Pencil size={14} /> تعديل بيانات العميل</button>
+              <button className="btn btn-danger btn-sm" onClick={onDeleteCustomer}><Trash2 size={14} /> حذف العميل</button>
+            </div>
+          </div>
+          <div className="info-grid">
+            <div className="info-item"><label>كود العميل</label><div>{customer.code || "—"}</div></div>
+            <div className="info-item">
+              <label>رقم الهاتف</label>
+              <div>{customer.phone || "—"}</div>
+              {phoneValidationMessage(customer.phone) && (
+                <div style={{ color: "var(--overdue)", fontSize: 12, marginTop: 3, fontWeight: 700 }}>{phoneValidationMessage(customer.phone)}</div>
+              )}
+            </div>
+            {customer.phone2 && (
+              <div className="info-item">
+                <label>رقم هاتف آخر</label>
+                <div>{customer.phone2}</div>
+                {phoneValidationMessage(customer.phone2) && (
+                  <div style={{ color: "var(--overdue)", fontSize: 12, marginTop: 3, fontWeight: 700 }}>{phoneValidationMessage(customer.phone2)}</div>
+                )}
+              </div>
+            )}
+            <div className="info-item"><label>{hasMany ? "إجمالي المدفوع (كل الحسابات)" : "إجمالي المدفوع"}</label><div style={{ color: "var(--done)", fontWeight: 700 }}>{money(totals.paid)}</div></div>
+            <div className="info-item"><label>{hasMany ? "إجمالي المتبقي (كل الحسابات)" : "إجمالي المتبقي"}</label><div style={{ color: totals.remaining > 0 ? "var(--amber)" : "inherit", fontWeight: 700 }}>{money(totals.remaining)}</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="acct-bar">
+        <div className="acct-tabs">
+          {accounts.map((a) => (
+            <button
+              key={a.id}
+              type="button"
+              className={`acct-tab ${a.id === account.id ? "active" : ""}`}
+              onClick={() => onSelectAccount(a.id)}
+            >
+              <Droplets size={14} /> {a.label}{a.deviceType ? ` · ${a.deviceType}` : ""}
+            </button>
+          ))}
+        </div>
+        <button className="btn btn-ghost btn-sm" onClick={onAddAccount}><Plus size={14} /> إضافة حساب آخر</button>
+      </div>
+
+      <div className="info-card">
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 800 }}>{account.label}</h3>
+          {!account.isMain && (
+            <div className="action-row">
+              <button className="btn btn-ghost btn-sm" onClick={() => onEditAccount(account)}><Pencil size={14} /> تعديل الحساب</button>
+              <button className="btn btn-danger btn-sm" onClick={() => onDeleteAccount(account)}><Trash2 size={14} /> حذف الحساب</button>
+            </div>
+          )}
+        </div>
+        <div className="info-grid">
+          <div className="info-item"><label>نوع الجهاز</label><div>{account.deviceType || "—"}</div></div>
+          <div className="info-item"><label>العنوان</label><div>{account.address || "—"}</div></div>
+          <div className="info-item"><label>تاريخ الشراء</label><div>{account.purchaseDate ? formatDateArabic(account.purchaseDate) : "—"}</div></div>
+          <div className="info-item"><label>فني المتابعة</label><div>{account.technician || "—"}</div></div>
+          {hasMany && (
+            <>
+              <div className="info-item"><label>مدفوع (هذا الحساب)</label><div style={{ color: "var(--done)", fontWeight: 700 }}>{money(accountTotals.paid)}</div></div>
+              <div className="info-item"><label>متبقي (هذا الحساب)</label><div style={{ color: accountTotals.remaining > 0 ? "var(--amber)" : "inherit", fontWeight: 700 }}>{money(accountTotals.remaining)}</div></div>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="section-title">
+        <h2><Wrench size={17} /> سجل الصيانة{hasMany ? ` — ${account.label}` : ""} <span className="count-pill">{visits.length}</span></h2>
+        <button className="btn btn-primary" onClick={onAddVisit}><Plus size={16} /> إضافة موعد</button>
+      </div>
+
+      {visits.length === 0 ? (
+        <EmptyState icon={<Calendar size={44} />} title={hasMany ? "لا توجد مواعيد صيانة مسجلة لهذا الحساب حتى الآن." : "لا توجد مواعيد صيانة مسجلة لهذا العميل حتى الآن."} message="أضف أول موعد صيانة لبدء المتابعة." />
+      ) : (
+        <div className="table-wrap">
+          <div style={{ overflowX: "auto" }}>
+            <table className="visits-table">
+              <thead>
+                <tr>
+                  <th>التاريخ</th>
+                  <th>الحالة</th>
+                  <th>الشموع</th>
+                  <th>المبلغ</th>
+                  <th>قطع غيار</th>
+                  <th>حالة الدفع</th>
+                  <th>سبب التأخير</th>
+                  <th>الإجراءات</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visits.map((v) => {
+                  const status = getVisitStatus(v);
+                  return (
+                    <tr key={v.id}>
+                      <td>{formatDateArabic(v.date)}</td>
+                      <td><StatusPill visit={v} /></td>
+                      <td>{v.completed ? formatCandles(v.candles) : "—"}</td>
+                      <td>{v.completed ? money(v.amount) : "—"}</td>
+                      <td>{v.completed ? (v.spareParts || "—") : "—"}</td>
+                      <td>
+                        {!v.completed
+                          ? "—"
+                          : v.paymentStatus === "remaining"
+                          ? <span className="badge badge-remaining">متبقي {money(v.remainingAmount)}</span>
+                          : <span className="badge badge-done">مدفوع بالكامل</span>}
+                      </td>
+                      <td>{status === "overdue" && v.delayReason ? v.delayReason : "—"}</td>
+                      <td>
+                        <div className="row-actions">
+                          <button className="btn btn-ghost btn-icon" onClick={() => onEditVisit(v)}><Pencil size={14} /></button>
+                          <button className="btn btn-danger btn-icon" onClick={() => onDeleteVisit(v)}><Trash2 size={14} /></button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================== MAINTENANCE PAGE ============================== */
+
+/* ============================== CUSTOM DROPDOWN ============================== */
+// A fully custom-styled dropdown, used instead of a native <select> so the
+// open list always matches our own dark theme (native option lists are
+// rendered by the browser/OS and can end up unreadable on some setups).
+function Dropdown({ value, options, onChange, className }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  const current = options.find((o) => String(o.value) === String(value));
+
+  useEffect(() => {
+    function handleClick(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  return (
+    <div className={`dropdown ${className || ""}`} ref={ref}>
+      <button type="button" className="dropdown-toggle" onClick={() => setOpen((o) => !o)}>
+        <span>{current ? current.label : ""}</span>
+        <ChevronLeft size={14} style={{ transform: open ? "rotate(-90deg)" : "rotate(0deg)", transition: "transform 0.15s ease" }} />
+      </button>
+      {open && (
+        <div className="dropdown-menu">
+          {options.map((o) => (
+            <div
+              key={o.value}
+              className={`dropdown-item ${String(o.value) === String(value) ? "selected" : ""}`}
+              onClick={() => { onChange(o.value); setOpen(false); }}
+            >
+              {o.label}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MaintenancePage({ customers, onOpenCustomer }) {
+  const [month, setMonth] = useState("all");
+  const [search, setSearch] = useState("");
+  const [activityFilter, setActivityFilter] = useState("all"); // all | active | inactive
+  const visits = useMemo(() => allVisits(customers), [customers]);
+
+  const activityCounts = useMemo(() => {
+    const active = customers.filter(isCustomerActive).length;
+    return { all: customers.length, active, inactive: customers.length - active };
+  }, [customers]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return visits.filter((v) => {
+      if (month !== "all") {
+        const d = parseDateOnly(v.date);
+        if (!d || d.getMonth() !== Number(month)) return false;
+      }
+      if (q) {
+        const matchesSearch = [v.customer.name, v.customer.phone, v.customer.phone2, v.customer.address].some(
+          (f) => (f || "").toLowerCase().includes(q)
+        );
+        if (!matchesSearch) return false;
+      }
+      if (activityFilter === "active" && !isCustomerActive(v.customer)) return false;
+      if (activityFilter === "inactive" && isCustomerActive(v.customer)) return false;
+      return true;
+    });
+  }, [visits, month, search, activityFilter]);
+
+  const done = useMemo(
+    () => filtered.filter((v) => getVisitStatus(v) === "done").sort((a, b) => parseDateOnly(b.date) - parseDateOnly(a.date)),
+    [filtered]
+  );
+  const upcoming = useMemo(
+    () => filtered.filter((v) => getVisitStatus(v) === "upcoming").sort((a, b) => parseDateOnly(a.date) - parseDateOnly(b.date)),
+    [filtered]
+  );
+  const overdue = useMemo(
+    () => filtered.filter((v) => getVisitStatus(v) === "overdue").sort((a, b) => parseDateOnly(a.date) - parseDateOnly(b.date)),
+    [filtered]
+  );
+
+  return (
+    <div>
+      <div className="section-title" style={{ marginTop: 0 }}>
+        <h2><Calendar size={17} /> مواعيد الصيانة</h2>
+        <Dropdown
+          className="month-select"
+          value={month}
+          onChange={setMonth}
+          options={[{ value: "all", label: "بدون فلتر" }, ...MONTH_NAMES.map((name, i) => ({ value: i, label: name }))]}
+        />
+      </div>
+
+      <div className="search-row">
+        <div className="search-box">
+          <input placeholder="ابحث بالاسم أو الرقم أو العنوان" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <Search size={16} />
+        </div>
+        <StatusFilterTabs value={activityFilter} onChange={setActivityFilter} counts={activityCounts} />
+      </div>
+
+      <div style={{ height: 16 }} />
+
+      <div className="maint-columns">
+        <div className="maint-col">
+          <div className="maint-col-head" style={{ color: "var(--done)" }}><CircleCheck size={17} /> الصيانات التي تمت ({done.length})</div>
+          {done.length === 0 ? (
+            <EmptyState icon={<CircleCheck size={32} />} title="لا توجد صيانات مكتملة" message="ستظهر هنا الزيارات المؤكدة." />
+          ) : done.map((v) => (
+            <div key={v.id} className="maint-item" onClick={() => onOpenCustomer(v.customer.id, v.accountId)}>
+              <div className="maint-item-top">
+                <span className="maint-item-name">{v.customer.name}</span>
+                <StatusPill visit={v} />
+              </div>
+              <div className="maint-item-meta"><Droplets size={12} /> {v.accountDeviceType || "—"}{!v.accountIsMain && v.accountLabel ? ` (${v.accountLabel})` : ""} · {formatDateArabic(v.date)}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="maint-col">
+          <div className="maint-col-head" style={{ color: "var(--upcoming)" }}><Clock size={17} /> الصيانات القادمة ({upcoming.length})</div>
+          {upcoming.length === 0 ? (
+            <EmptyState icon={<Clock size={32} />} title="لا توجد صيانات قادمة" message="ستظهر هنا المواعيد المستقبلية." />
+          ) : upcoming.map((v) => (
+            <div key={v.id} className="maint-item" onClick={() => onOpenCustomer(v.customer.id, v.accountId)}>
+              <div className="maint-item-top">
+                <span className="maint-item-name">{v.customer.name}</span>
+                <StatusPill visit={v} />
+              </div>
+              <div className="maint-item-meta"><Droplets size={12} /> {v.accountDeviceType || "—"}{!v.accountIsMain && v.accountLabel ? ` (${v.accountLabel})` : ""} · {formatDateArabic(v.date)}</div>
+            </div>
+          ))}
+        </div>
+
+        <div className="maint-col">
+          <div className="maint-col-head" style={{ color: "var(--overdue)" }}><AlertTriangle size={17} /> الصيانات المتأخرة ({overdue.length})</div>
+          {overdue.length === 0 ? (
+            <EmptyState icon={<AlertTriangle size={32} />} title="لا توجد صيانات متأخرة" message="عمل ممتاز، كل شيء تحت السيطرة." />
+          ) : overdue.map((v) => (
+            <div key={v.id} className="maint-item" onClick={() => onOpenCustomer(v.customer.id, v.accountId)}>
+              <div className="maint-item-top">
+                <span className="maint-item-name">{v.customer.name}</span>
+                <StatusPill visit={v} />
+              </div>
+              <div className="maint-item-meta"><Droplets size={12} /> {v.accountDeviceType || "—"}{!v.accountIsMain && v.accountLabel ? ` (${v.accountLabel})` : ""} · {formatDateArabic(v.date)}</div>
+              {v.delayReason && <div className="maint-item-reason">السبب: {v.delayReason}</div>}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== CENTERS PAGES ============================== */
+
+function CenterModal({ centers, onSave, onClose }) {
+  const [letter, setLetter] = useState(nextFreeLetter(centers));
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  function submit() {
+    const l = letter.trim().toUpperCase();
+    if (!/^[A-Z]$/.test(l)) return setError("الكود لازم يكون حرف إنجليزي واحد (A-Z)");
+    if (centers.some((c) => c.letter === l)) return setError("الحرف ده مستخدم في مركز تاني");
+    if (!name.trim()) return setError("اسم المركز مطلوب");
+    onSave({ letter: l, name: name.trim() });
+  }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card narrow" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>إضافة مركز جديد</h3>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-row">
+          <div className="form-group">
+            <label>اسم المركز *</label>
+            <input className="form-control" value={name} onChange={(e) => { setName(e.target.value); setError(""); }} placeholder="مثال: طهطا" />
+          </div>
+          <div className="form-group">
+            <label>حرف الكود *</label>
+            <input className="form-control" maxLength={1} value={letter} onChange={(e) => { setLetter(e.target.value); setError(""); }} placeholder="K" style={{ textTransform: "uppercase", textAlign: "center", fontWeight: 800 }} />
+          </div>
+        </div>
+        {error && <div style={{ color: "var(--overdue)", fontSize: 12.5, fontWeight: 600 }}>{error}</div>}
+        <div style={{ fontSize: 12.5, color: "var(--text-muted)", marginTop: 8 }}>أكواد عملاء المركز هتبدأ بالحرف ده (مثال: {(letter || "K").toUpperCase()}-1).</div>
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose}>إلغاء</button>
+          <button className="btn btn-primary" onClick={submit}><Check size={16} /> إضافة المركز</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VisitRow({ v, centers, onOpen, showAmount }) {
+  const center = centers.find((c) => c.letter === centerKey(v.customer, centers));
+  return (
+    <div className="maint-item" onClick={() => onOpen(v.customer.id, v.accountId)}>
+      <div className="maint-item-top">
+        <span className="maint-item-name">{v.customer.name}</span>
+        <StatusPill visit={v} />
+      </div>
+      <div className="maint-item-meta">
+        <span className="center-chip">{center ? `${center.letter} · ${center.name}` : "بدون مركز"}</span>
+        <Droplets size={12} /> {v.accountDeviceType || "—"} · {formatDateArabic(v.date)}
+        {showAmount && v.paymentStatus === "remaining" ? ` · متبقي ${money(v.remainingAmount)}` : ""}
+      </div>
+      {v.delayReason && <div className="maint-item-reason">السبب: {v.delayReason}</div>}
+    </div>
+  );
+}
+
+function HomePage({ customers, centers, onOpenCenter, onOpenCustomer, onAddCenter }) {
+  const [view, setView] = useState(null); // null | customers | overdue | unpaid
+  const gridRef = useRef(null);
+  const visits = useMemo(() => allVisits(customers), [customers]);
+  const overdue = useMemo(() => visits.filter((v) => getVisitStatus(v) === "overdue").sort((a, b) => parseDateOnly(a.date) - parseDateOnly(b.date)), [visits]);
+  const unpaid = useMemo(() => visits.filter((v) => v.paymentStatus === "remaining"), [visits]);
+
+  const stats = useMemo(() => {
+    const map = {};
+    for (const c of customers) {
+      const k = centerKey(c, centers);
+      const s = (map[k] = map[k] || { customers: 0, overdue: 0, unpaid: 0 });
+      s.customers += 1;
+      for (const v of customerAllVisits(c)) {
+        if (getVisitStatus(v) === "overdue") s.overdue += 1;
+        if (v.paymentStatus === "remaining") s.unpaid += 1;
+      }
+    }
+    return map;
+  }, [customers, centers]);
+
+  const cards = useMemo(() => {
+    const list = [...centers];
+    if (stats[UNCLASSIFIED]) list.push({ letter: UNCLASSIFIED, name: "بدون مركز", virtual: true });
+    return list;
+  }, [centers, stats]);
+
+  const titles = { customers: "كل العملاء", overdue: "الصيانات المتأخرة", unpaid: "الزيارات غير المسددة" };
+  const today = new Date();
+
+  return (
+    <div>
+      <div className="hero">
+        <div>
+          <h2>أهلاً بيك في أوزون 👋</h2>
+          <p>{today.getDate()} {MONTH_NAMES[today.getMonth()]} {today.getFullYear()} · اختار المركز عشان تشوف عملاءه وتتابع الصيانة</p>
+        </div>
+        <button className="btn btn-white" onClick={onAddCenter}><Plus size={16} /> إضافة مركز</button>
+      </div>
+
+      <div className="kpi-grid">
+        <KPICard icon={<MapPin size={19} />} iconBg="var(--primary-soft)" iconColor="var(--primary)" value={centers.length} label="عدد المراكز"
+          onClick={() => { setView(null); gridRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }); }} />
+        <KPICard icon={<Users size={19} />} iconBg="var(--upcoming-soft)" iconColor="var(--upcoming)" value={customers.length} label="عدد العملاء"
+          selected={view === "customers"} onClick={() => setView(view === "customers" ? null : "customers")} />
+        <KPICard icon={<AlertTriangle size={19} />} iconBg="var(--overdue-soft)" iconColor="var(--overdue)" value={overdue.length} label="الصيانات المتأخرة"
+          selected={view === "overdue"} onClick={() => setView(view === "overdue" ? null : "overdue")} />
+        <KPICard icon={<Coins size={19} />} iconBg="var(--amber-soft)" iconColor="var(--amber)" value={unpaid.length} label="زيارات غير مسددة"
+          selected={view === "unpaid"} onClick={() => setView(view === "unpaid" ? null : "unpaid")} />
+      </div>
+
+      {view && (
+        <div className="view-panel">
+          <div className="view-panel-head">
+            <h3><Filter size={17} /> {titles[view]} <span className="count-pill">{view === "customers" ? customers.length : view === "overdue" ? overdue.length : unpaid.length}</span></h3>
+            <button className="btn btn-ghost btn-sm" onClick={() => setView(null)}><X size={14} /> إغلاق</button>
+          </div>
+          {view === "customers" && (customers.length === 0
+            ? <EmptyState icon={<Users size={40} />} title="لا يوجد عملاء" message="افتح أي مركز وأضف أول عميل." />
+            : <div className="customer-grid">{customers.map((c) => <CustomerCard key={c.id} customer={c} onClick={() => onOpenCustomer(c.id)} />)}</div>)}
+          {view === "overdue" && (overdue.length === 0
+            ? <EmptyState icon={<CircleCheck size={40} />} title="ممتاز!" message="مفيش صيانات متأخرة." />
+            : <div className="rows-grid">{overdue.map((v) => <VisitRow key={v.id} v={v} centers={centers} onOpen={onOpenCustomer} />)}</div>)}
+          {view === "unpaid" && (unpaid.length === 0
+            ? <EmptyState icon={<CircleCheck size={40} />} title="ممتاز!" message="كل الزيارات مسددة." />
+            : <div className="rows-grid">{unpaid.map((v) => <VisitRow key={v.id} v={v} centers={centers} onOpen={onOpenCustomer} showAmount />)}</div>)}
+        </div>
+      )}
+
+      <div className="section-title" ref={gridRef}>
+        <h2><MapPin size={17} /> المراكز <span className="count-pill">{cards.length}</span></h2>
+      </div>
+      <div className="centers-grid">
+        {cards.map((c) => {
+          const s = stats[c.letter] || { customers: 0, overdue: 0, unpaid: 0 };
+          return (
+            <div key={c.letter} className="center-card" onClick={() => onOpenCenter(c.letter)}>
+              <div className="center-letter">{c.letter}</div>
+              <div className="center-name">{c.name}</div>
+              <div className="center-count">{s.customers} عميل</div>
+              <div className="center-tags">
+                {s.overdue > 0 && <span className="badge badge-overdue">{s.overdue} متأخرة</span>}
+                {s.unpaid > 0 && <span className="badge badge-remaining">{s.unpaid} غير مسددة</span>}
+                {s.overdue === 0 && s.unpaid === 0 && s.customers > 0 && <span className="badge badge-done">كله تمام</span>}
+              </div>
+            </div>
+          );
+        })}
+        <div className="center-card add" onClick={onAddCenter}><Plus size={26} /> إضافة مركز</div>
+      </div>
+    </div>
+  );
+}
+
+function CenterPage({ center, customers, onBack, onOpenCustomer, onAddCustomer, onDeleteCenter }) {
+  const [search, setSearch] = useState("");
+  const [activity, setActivity] = useState("all");
+  const [showFilters, setShowFilters] = useState(false);
+  const [month, setMonth] = useState("all");
+  const [year, setYear] = useState("all");
+
+  const years = useMemo(() => {
+    const s = new Set([ACTIVE_YEAR]);
+    for (const c of customers) for (const v of customerAllVisits(c)) { const d = parseDateOnly(v.date); if (d) s.add(d.getFullYear()); }
+    return [...s].sort((a, b) => b - a);
+  }, [customers]);
+
+  const counts = useMemo(() => {
+    const active = customers.filter(isCustomerActive).length;
+    return { all: customers.length, active, inactive: customers.length - active };
+  }, [customers]);
+
+  const stats = useMemo(() => {
+    let overdue = 0, unpaid = 0;
+    for (const c of customers) for (const v of customerAllVisits(c)) {
+      if (getVisitStatus(v) === "overdue") overdue += 1;
+      if (v.paymentStatus === "remaining") unpaid += 1;
+    }
+    return { overdue, unpaid };
+  }, [customers]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return customers.filter((c) => {
+      if (q) {
+        const hit = [c.name, c.phone, c.phone2, c.address, c.code].some((f) => (f || "").toLowerCase().includes(q)) ||
+          (c.accounts || []).some((a) => [a.address, a.label, a.deviceType].some((f) => (f || "").toLowerCase().includes(q)));
+        if (!hit) return false;
+      }
+      if (activity === "active" && !isCustomerActive(c)) return false;
+      if (activity === "inactive" && isCustomerActive(c)) return false;
+      if (month !== "all" || year !== "all") {
+        const ok = customerAllVisits(c).some((v) => {
+          const d = parseDateOnly(v.date);
+          if (!d) return false;
+          if (year !== "all" && d.getFullYear() !== Number(year)) return false;
+          if (month !== "all" && d.getMonth() !== Number(month)) return false;
+          return true;
+        });
+        if (!ok) return false;
+      }
+      return true;
+    }).sort((a, b) => codeNumber(a) - codeNumber(b));
+  }, [customers, search, activity, month, year]);
+
+  const filterCount = (month !== "all" ? 1 : 0) + (year !== "all" ? 1 : 0);
+  const isVirtual = !!center.virtual;
+
+  return (
+    <div>
+      <button className="back-btn" onClick={onBack}><ArrowRight size={15} /> كل المراكز</button>
+
+      <div className="center-head">
+        <div className="center-letter big">{center.letter}</div>
+        <div className="center-head-info">
+          <h2>مركز {center.name}</h2>
+          <div className="center-stats">
+            <span className="badge badge-muted">{customers.length} عميل</span>
+            <span className="badge badge-done">{counts.active} نشط في {ACTIVE_YEAR}</span>
+            {stats.overdue > 0 && <span className="badge badge-overdue">{stats.overdue} صيانة متأخرة</span>}
+            {stats.unpaid > 0 && <span className="badge badge-remaining">{stats.unpaid} غير مسددة</span>}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {center.custom && customers.length === 0 && (
+            <button className="btn btn-danger btn-sm" onClick={onDeleteCenter}><Trash2 size={14} /> حذف المركز</button>
+          )}
+          {!isVirtual && <button className="btn btn-primary" onClick={onAddCustomer}><Plus size={16} /> إضافة عميل</button>}
+        </div>
+      </div>
+
+      <div className="search-row">
+        <div className="search-box">
+          <input placeholder="ابحث بالاسم أو رقم التليفون أو العنوان" value={search} onChange={(e) => setSearch(e.target.value)} />
+          <Search size={16} />
+        </div>
+        <StatusFilterTabs value={activity} onChange={setActivity} counts={counts} />
+        <button className="btn btn-ghost" onClick={() => setShowFilters((s) => !s)}>
+          <Filter size={15} /> فلترة أكثر {filterCount > 0 && <span className="filter-btn-badge">{filterCount}</span>}
+        </button>
+      </div>
+
+      {showFilters && (
+        <div className="filter-panel">
+          <div className="form-group">
+            <label>الشهر</label>
+            <select className="form-control" value={month} onChange={(e) => setMonth(e.target.value)}>
+              <option value="all">كل الشهور</option>
+              {MONTH_NAMES.map((m, i) => <option key={i} value={i}>{m}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>السنة</label>
+            <select className="form-control" value={year} onChange={(e) => setYear(e.target.value)}>
+              <option value="all">كل السنين</option>
+              {years.map((y) => <option key={y} value={y}>{y}</option>)}
+            </select>
+          </div>
+          <button className="btn btn-ghost" onClick={() => { setMonth("all"); setYear("all"); }}><X size={14} /> مسح الفلاتر</button>
+          <div style={{ flexBasis: "100%", fontSize: 12.5, color: "var(--text-muted)" }}>بيظهر العملاء اللي عندهم موعد صيانة في الشهر/السنة المختارين.</div>
+        </div>
+      )}
+
+      <div style={{ height: 16 }} />
+
+      {customers.length === 0 ? (
+        <EmptyState icon={<Users size={44} />} title="المركز لسه فاضي" message="اضغط «إضافة عميل» وابدأ أول عميل في المركز ده." />
+      ) : filtered.length === 0 ? (
+        <EmptyState icon={<Search size={44} />} title="لا توجد نتائج" message="جرّب بحث أو فلتر مختلف." />
+      ) : (
+        <div className="customer-grid">
+          {filtered.map((c) => <CustomerCard key={c.id} customer={c} onClick={() => onOpenCustomer(c.id)} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================== GOOGLE SHEETS SYNC ============================== */
+
+function loadSheetsConfig() {
+  const hasDefaultSecret = DEFAULT_SHEETS_SECRET && DEFAULT_SHEETS_SECRET !== "PUT_YOUR_SECRET_HERE";
+  const defaults = hasDefaultSecret
+    ? { url: DEFAULT_SHEETS_URL, secret: DEFAULT_SHEETS_SECRET, auto: true }
+    : { url: "", secret: "", auto: false };
+  try {
+    const raw = window.localStorage.getItem(SHEETS_KEY);
+    if (raw) {
+      const c = JSON.parse(raw);
+      if (c.url && c.secret) return { url: c.url, secret: c.secret, auto: !!c.auto };
+    }
+  } catch (e) {}
+  return defaults;
+}
+
+async function sheetsPull(url, secret) {
+  const full = url + (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(secret);
+  const res = await fetch(full);
+  const j = await res.json();
+  if (!j.ok) throw new Error(j.error === "unauthorized" ? "كلمة السر غير صحيحة" : j.error);
+  return (j.customers || []).map((c) => ({
+    ...c,
+    visits: Array.isArray(c.visits) ? c.visits : [],
+    accounts: (Array.isArray(c.accounts) ? c.accounts : []).map((a) => ({ ...a, visits: Array.isArray(a.visits) ? a.visits : [] })),
+  }));
+}
+
+async function sheetsPush(url, secret, customers) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" }, // text/plain avoids the CORS preflight that Apps Script can't answer
+    body: JSON.stringify({ key: secret, customers }),
+  });
+  const j = await res.json();
+  if (!j.ok) throw new Error(j.error === "unauthorized" ? "كلمة السر غير صحيحة" : j.error);
+  return j.count;
+}
+
+function SheetsModal({ config, status, count, onSave, onPull, onPush, onClose }) {
+  const [form, setForm] = useState(config);
+  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const busy = status === "syncing";
+  const ready = form.url.trim() && form.secret.trim();
+  const statusText = { idle: "غير متصل", syncing: "جاري المزامنة...", ok: "متصل ✓", error: "فشل الاتصال" }[status] || "";
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>الربط مع Google Sheets</h3>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="form-group">
+          <label>رابط الـ Web app (ينتهي بـ /exec)</label>
+          <input className="form-control" dir="ltr" value={form.url} onChange={(e) => set("url", e.target.value.trim())} placeholder="https://script.google.com/macros/s/.../exec" />
+        </div>
+        <div className="form-group">
+          <label>كلمة السر (SECRET اللي في الكود)</label>
+          <input className="form-control" dir="ltr" type="password" value={form.secret} onChange={(e) => set("secret", e.target.value)} />
+        </div>
+        <div className="form-group">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={form.auto} onChange={(e) => set("auto", e.target.checked)} />
+            مزامنة تلقائية (جلب عند الفتح + رفع بعد كل تعديل)
+          </label>
+        </div>
+        <p style={{ color: "var(--text-muted)", fontSize: 13, margin: "0 0 4px" }}>
+          الحالة: {statusText} — العملاء على الجهاز: {count}
+        </p>
+        <div className="modal-actions" style={{ flexWrap: "wrap" }}>
+          <button className="btn btn-ghost" onClick={onClose}>إغلاق</button>
+          <button className="btn btn-ghost" disabled={!ready || busy} onClick={() => onPull(form)}><Download size={14} /> جلب من الشيت</button>
+          <button className="btn btn-ghost" disabled={!ready || busy} onClick={() => onPush(form)}><Upload size={14} /> رفع للشيت</button>
+          <button className="btn btn-primary" onClick={() => onSave(form)}>حفظ الإعدادات</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== MAIN APP ============================== */
+
+function OzonApp() {
+  const [customers, setCustomers] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [page, setPage] = useState("dashboard"); // dashboard | details | maintenance
+  const [selectedId, setSelectedId] = useState(null);
+  const [centers, setCenters] = useState(DEFAULT_CENTERS);
+  const [selectedCenter, setSelectedCenter] = useState(null);
+  const [showCenterModal, setShowCenterModal] = useState(false);
+  const [backPage, setBackPage] = useState("dashboard");
+  const [search, setSearch] = useState("");
+
+  const [showCustomerModal, setShowCustomerModal] = useState(false);
+  const [editingCustomer, setEditingCustomer] = useState(null); // customer object or null (add mode)
+  const [showVisitModal, setShowVisitModal] = useState(false);
+  const [editingVisit, setEditingVisit] = useState(null); // visit object or null (add mode)
+  const [activeAccountId, setActiveAccountId] = useState(MAIN_ACCOUNT_ID); // which account tab is open in the details page
+  const [showAccountModal, setShowAccountModal] = useState(false);
+  const [editingAccount, setEditingAccount] = useState(null); // extra-account object or null (add mode)
+  const [confirmState, setConfirmState] = useState(null); // { type: 'customer'|'visit', ... }
+
+  const [toasts, setToasts] = useState([]);
+  const toastTimers = useRef({});
+
+  const pushToast = useCallback((type, message) => {
+    const id = uid();
+    setToasts((t) => [...t, { id, type, message }]);
+    toastTimers.current[id] = setTimeout(() => {
+      setToasts((t) => t.filter((x) => x.id !== id));
+      delete toastTimers.current[id];
+    }, 3200);
+  }, []);
+
+  const fileInputRef = useRef(null);
+
+  /* ---------- Google Sheets sync ---------- */
+  const [sheetsCfg, setSheetsCfg] = useState(loadSheetsConfig);
+  const [showSheetsModal, setShowSheetsModal] = useState(false);
+  const [sheetStatus, setSheetStatus] = useState("idle"); // idle | syncing | ok | error
+  const syncReadyRef = useRef(false);   // auto-push is allowed only after a successful pull/push
+  const lastSyncedRef = useRef("");     // JSON of the data last known to match the sheet
+
+  function persistSheetsCfg(cfg) {
+    setSheetsCfg(cfg);
+    try { window.localStorage.setItem(SHEETS_KEY, JSON.stringify(cfg)); } catch (e) {}
+  }
+
+  function handleSheetsSave(form) {
+    persistSheetsCfg(form);
+    setShowSheetsModal(false);
+    pushToast("success", "تم حفظ إعدادات الربط.");
+  }
+
+  async function handleSheetsPull(form) {
+    if (customers.length > 0 && !window.confirm("هيتم استبدال البيانات اللي على الجهاز ببيانات الشيت. متأكد؟")) return;
+    persistSheetsCfg(form);
+    setSheetStatus("syncing");
+    try {
+      const list = await sheetsPull(form.url, form.secret);
+      setCustomers(list);
+      lastSyncedRef.current = JSON.stringify(list);
+      syncReadyRef.current = true;
+      setSheetStatus("ok");
+      pushToast("success", `تم جلب ${list.length} عميل من الشيت.`);
+    } catch (e) {
+      setSheetStatus("error");
+      pushToast("error", "تعذر الجلب: " + e.message);
+    }
+  }
+
+  async function handleSheetsPush(form) {
+    if (customers.length === 0) { pushToast("error", "لا توجد بيانات لرفعها."); return; }
+    if (!window.confirm("هيتم استبدال محتوى الشيت بالبيانات اللي على الجهاز. متأكد؟")) return;
+    persistSheetsCfg(form);
+    setSheetStatus("syncing");
+    try {
+      const n = await sheetsPush(form.url, form.secret, customers);
+      lastSyncedRef.current = JSON.stringify(customers);
+      syncReadyRef.current = true;
+      setSheetStatus("ok");
+      pushToast("success", `تم رفع ${n} عميل للشيت.`);
+    } catch (e) {
+      setSheetStatus("error");
+      pushToast("error", "تعذر الرفع: " + e.message);
+    }
+  }
+
+  // Auto mode: pull once when the app opens.
+  useEffect(() => {
+    if (!loaded || !sheetsCfg.auto || !sheetsCfg.url || !sheetsCfg.secret) return;
+    let cancelled = false;
+    (async () => {
+      setSheetStatus("syncing");
+      try {
+        const list = await sheetsPull(sheetsCfg.url, sheetsCfg.secret);
+        if (cancelled) return;
+        if (list.length) {
+          setCustomers(list);
+          lastSyncedRef.current = JSON.stringify(list);
+        }
+        syncReadyRef.current = true;
+        setSheetStatus("ok");
+      } catch (e) {
+        if (cancelled) return;
+        setSheetStatus("error");
+        pushToast("error", "تعذر الاتصال بالشيت: " + e.message);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  // Auto mode: push a moment after every change.
+  useEffect(() => {
+    if (!loaded || !sheetsCfg.auto || !sheetsCfg.url || !sheetsCfg.secret) return;
+    if (!syncReadyRef.current || customers.length === 0) return;
+    const json = JSON.stringify(customers);
+    if (json === lastSyncedRef.current) return;
+    const t = setTimeout(async () => {
+      setSheetStatus("syncing");
+      try {
+        await sheetsPush(sheetsCfg.url, sheetsCfg.secret, customers);
+        lastSyncedRef.current = json;
+        setSheetStatus("ok");
+      } catch (e) {
+        setSheetStatus("error");
+        pushToast("error", "تعذر الرفع للشيت: " + e.message);
+      }
+    }, 2500);
+    return () => clearTimeout(t);
+  }, [customers, loaded, sheetsCfg, pushToast]);
+
+  // Load persisted data on mount (from the browser's local storage on this device).
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setCustomers(parsed);
+      }
+    } catch (e) {
+      // corrupted or missing data — start empty
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  // Persist whenever data changes (after initial load), so closing/reopening the tab keeps the data.
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(customers));
+    } catch (e) {
+      pushToast("error", "تعذر حفظ البيانات محليًا، حاول مرة أخرى.");
+    }
+  }, [customers, loaded, pushToast]);
+
+  // Custom centers (added by the user) are stored next to the 10 built-in ones.
+  const [centersLoaded, setCentersLoaded] = useState(false);
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(CENTERS_KEY);
+      if (raw) {
+        const extra = JSON.parse(raw);
+        if (Array.isArray(extra)) setCenters([...DEFAULT_CENTERS, ...extra.filter((x) => x && x.letter && !DEFAULT_CENTERS.some((d) => d.letter === x.letter)).map((x) => ({ ...x, custom: true }))]);
+      }
+    } catch (e) {}
+    setCentersLoaded(true);
+  }, []);
+  useEffect(() => {
+    if (!centersLoaded) return;
+    try {
+      window.localStorage.setItem(CENTERS_KEY, JSON.stringify(centers.filter((c) => c.custom).map(({ letter, name }) => ({ letter, name }))));
+    } catch (e) {}
+  }, [centers, centersLoaded]);
+
+  function saveCenter(c) {
+    setCenters((cs) => [...cs, { ...c, custom: true }]);
+    setShowCenterModal(false);
+    pushToast("success", `تم إضافة مركز ${c.name}.`);
+  }
+
+  function openCenter(letter) {
+    setSelectedCenter(letter);
+    setSelectedId(null);
+    setPage("center");
+  }
+
+  function deleteCenter() {
+    setCenters((cs) => cs.filter((c) => c.letter !== selectedCenter));
+    setSelectedCenter(null);
+    setPage("dashboard");
+    pushToast("success", "تم حذف المركز.");
+  }
+
+  /* ---------- Excel export / import ---------- */
+
+  function handleExportExcel() {
+    if (customers.length === 0) {
+      pushToast("error", "لا توجد بيانات لتصديرها بعد.");
+      return;
+    }
+    try {
+      exportCustomersToExcel(customers);
+      pushToast("success", "تم تصدير ملف Excel بنجاح.");
+    } catch (e) {
+      pushToast("error", "تعذر تصدير ملف Excel.");
+    }
+  }
+
+  function handleImportClick() {
+    fileInputRef.current?.click();
+  }
+
+  const [pendingImport, setPendingImport] = useState(null); // staged parsed customers, waiting for merge/replace choice
+
+  async function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    try {
+      const imported = await importCustomersFromExcel(file);
+      if (imported.length === 0) {
+        pushToast("error", "لم يتم العثور على بيانات عملاء صالحة في الملف.");
+        return;
+      }
+      setPendingImport(imported);
+    } catch (err) {
+      pushToast("error", "تعذر قراءة ملف Excel. تأكد أنه بنفس تنسيق التصدير.");
+    }
+  }
+
+  const jsonFileInputRef = useRef(null);
+
+  function handleExportJSON() {
+    if (customers.length === 0) {
+      pushToast("error", "لا توجد بيانات لتصديرها بعد.");
+      return;
+    }
+    try {
+      exportCustomersToJSON(customers);
+      pushToast("success", "تم تصدير ملف JSON بنجاح.");
+    } catch (e) {
+      pushToast("error", "تعذر تصدير ملف JSON.");
+    }
+  }
+
+  function handleImportJSONClick() {
+    jsonFileInputRef.current?.click();
+  }
+
+  async function handleImportJSONFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const imported = await importCustomersFromJSON(file);
+      if (imported.length === 0) {
+        pushToast("error", "لم يتم العثور على بيانات عملاء صالحة في الملف.");
+        return;
+      }
+      setPendingImport(imported);
+    } catch (err) {
+      pushToast("error", "تعذر قراءة ملف JSON. تأكد أنه بنفس تنسيق التصدير.");
+    }
+  }
+
+  const selectedCustomer = useMemo(
+    () => customers.find((c) => c.id === selectedId) || null,
+    [customers, selectedId]
+  );
+
+  /* ---------- Import mode (merge vs replace) ---------- */
+
+  function handleImportMerge() {
+    if (!pendingImport) return;
+    const withCodes = ensureUniqueCodes(customers, pendingImport);
+    setCustomers((cs) => [...withCodes, ...cs]);
+    pushToast("success", `تم دمج ${withCodes.length} عميل مع البيانات الحالية.`);
+    setPendingImport(null);
+  }
+
+  function handleImportReplace() {
+    if (!pendingImport) return;
+    const withCodes = ensureUniqueCodes([], pendingImport);
+    setCustomers(withCodes);
+    pushToast("success", `تم استبدال البيانات بـ ${withCodes.length} عميل من الملف.`);
+    setPendingImport(null);
+  }
+
+  function handleImportCancel() {
+    setPendingImport(null);
+  }
+
+  /* ---------- Customer handlers ---------- */
+
+  function openAddCustomer() {
+    setEditingCustomer(null);
+    setShowCustomerModal(true);
+  }
+
+  function openEditCustomer(customer) {
+    setEditingCustomer(customer);
+    setShowCustomerModal(true);
+  }
+
+  function saveCustomer(form) {
+    if (editingCustomer) {
+      const code = (form.code && form.code.trim()) || editingCustomer.code;
+      setCustomers((cs) => cs.map((c) => (c.id === editingCustomer.id ? { ...c, ...form, code } : c)));
+      pushToast("success", "تم تحديث بيانات العميل بنجاح.");
+    } else {
+      const code = (form.code && form.code.trim()) || (selectedCenter && selectedCenter !== UNCLASSIFIED ? nextCodeForCenter(customers, selectedCenter) : nextCustomerCode(customers));
+      const newCustomer = { id: uid(), ...form, code, visits: [] };
+      setCustomers((cs) => [newCustomer, ...cs]);
+      setSelectedId(newCustomer.id);
+      setActiveAccountId(MAIN_ACCOUNT_ID);
+      setBackPage(page === "center" ? "center" : "dashboard");
+      setPage("details");
+      pushToast("success", "تم إضافة العميل بنجاح.");
+    }
+    setShowCustomerModal(false);
+    setEditingCustomer(null);
+  }
+
+  function requestDeleteCustomer(customer) {
+    setConfirmState({
+      type: "customer",
+      title: "حذف العميل",
+      message: `هل أنت متأكد من حذف "${customer.name}"؟ سيتم حذف جميع مواعيد الصيانة الخاصة به نهائيًا.`,
+      onConfirm: () => {
+        setCustomers((cs) => cs.filter((c) => c.id !== customer.id));
+        setConfirmState(null);
+        setPage(backPage);
+        setSelectedId(null);
+        pushToast("success", "تم حذف العميل.");
+      },
+    });
+  }
+
+  /* ---------- Visit handlers ---------- */
+
+  function openAddVisit() {
+    setEditingVisit(null);
+    setShowVisitModal(true);
+  }
+
+  function openEditVisit(visit) {
+    setEditingVisit(visit);
+    setShowVisitModal(true);
+  }
+
+  function saveVisit(form) {
+    if (!selectedCustomer) return;
+    if (editingVisit) {
+      setCustomers((cs) =>
+        cs.map((c) =>
+          c.id === selectedCustomer.id
+            ? mapAccountVisits(c, activeAccountId, (vs) => vs.map((v) => (v.id === editingVisit.id ? { ...v, ...form } : v)))
+            : c
+        )
+      );
+      pushToast("success", "تم تحديث موعد الصيانة.");
+    } else {
+      const newVisit = { id: uid(), ...form };
+      setCustomers((cs) =>
+        cs.map((c) => (c.id === selectedCustomer.id ? mapAccountVisits(c, activeAccountId, (vs) => [...vs, newVisit]) : c))
+      );
+      pushToast("success", "تم إضافة موعد الصيانة.");
+    }
+    setShowVisitModal(false);
+    setEditingVisit(null);
+  }
+
+  function requestDeleteVisit(visit) {
+    setConfirmState({
+      type: "visit",
+      title: "حذف موعد الصيانة",
+      message: "هل أنت متأكد من حذف موعد الصيانة؟",
+      onConfirm: () => {
+        setCustomers((cs) =>
+          cs.map((c) =>
+            c.id === selectedCustomer.id ? mapAccountVisits(c, activeAccountId, (vs) => vs.filter((v) => v.id !== visit.id)) : c
+          )
+        );
+        setConfirmState(null);
+        pushToast("success", "تم حذف موعد الصيانة.");
+      },
+    });
+  }
+
+  /* ---------- Extra account handlers (a customer with more than one filter) ---------- */
+
+  function openAddAccount() {
+    setEditingAccount(null);
+    setShowAccountModal(true);
+  }
+
+  function openEditAccount(account) {
+    // Use the raw stored account (not the display copy) so an empty name stays empty.
+    const raw = (selectedCustomer?.accounts || []).find((a) => a.id === account.id);
+    if (!raw) return;
+    setEditingAccount(raw);
+    setShowAccountModal(true);
+  }
+
+  function saveAccount(form) {
+    if (!selectedCustomer) return;
+    const clean = {
+      label: (form.label || "").trim(),
+      address: (form.address || "").trim(),
+      deviceType: (form.deviceType || "").trim(),
+      purchaseDate: form.purchaseDate || "",
+      technician: (form.technician || "").trim(),
+    };
+    if (editingAccount) {
+      setCustomers((cs) =>
+        cs.map((c) =>
+          c.id === selectedCustomer.id
+            ? { ...c, accounts: (c.accounts || []).map((a) => (a.id === editingAccount.id ? { ...a, ...clean } : a)) }
+            : c
+        )
+      );
+      pushToast("success", "تم تحديث الحساب.");
+    } else {
+      const newAccount = { id: uid(), ...clean, visits: [] };
+      setCustomers((cs) =>
+        cs.map((c) => (c.id === selectedCustomer.id ? { ...c, accounts: [...(c.accounts || []), newAccount] } : c))
+      );
+      setActiveAccountId(newAccount.id);
+      pushToast("success", "تم إضافة الحساب الجديد.");
+    }
+    setShowAccountModal(false);
+    setEditingAccount(null);
+  }
+
+  function requestDeleteAccount(account) {
+    const n = (account.visits || []).length;
+    setConfirmState({
+      type: "account",
+      title: "حذف الحساب",
+      message: `هل أنت متأكد من حذف "${account.label}"؟${n > 0 ? ` سيتم حذف ${n} من مواعيد الصيانة الخاصة به نهائيًا.` : ""}`,
+      onConfirm: () => {
+        setCustomers((cs) =>
+          cs.map((c) => (c.id === selectedCustomer.id ? { ...c, accounts: (c.accounts || []).filter((a) => a.id !== account.id) } : c))
+        );
+        setActiveAccountId(MAIN_ACCOUNT_ID);
+        setConfirmState(null);
+        pushToast("success", "تم حذف الحساب.");
+      },
+    });
+  }
+
+  function goToCustomer(id, accountId) {
+    setSelectedId(id);
+    setActiveAccountId(accountId || MAIN_ACCOUNT_ID);
+    const target = customers.find((c) => c.id === id);
+    if (page !== "details") setBackPage(page);
+    if (target && page === "dashboard") { /* opened from home lists */ }
+    setPage("details");
+  }
+
+  return (
+    <div className="ozon-root">
+      <GlobalStyles />
+      <Waves />
+      <div className="container">
+        <div className="topbar">
+          <div className="brand">
+            <div className="brand-mark"><Droplets size={22} /></div>
+            <div className="brand-text">
+              <h1>أوزون لحلول تنقية المياه</h1>
+              <span>نظام إدارة العملاء والصيانة</span>
+            </div>
+          </div>
+          <div className="nav-tabs">
+            <button className={`nav-tab ${page !== "maintenance" ? "active" : ""}`} onClick={() => { setSelectedId(null); setSelectedCenter(null); setPage("dashboard"); }}>
+              <MapPin size={15} /> المراكز
+            </button>
+            <button className={`nav-tab ${page === "maintenance" ? "active" : ""}`} onClick={() => setPage("maintenance")}>
+              <Wrench size={15} /> مواعيد الصيانة
+            </button>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={handleImportFile}
+            />
+            <input
+              ref={jsonFileInputRef}
+              type="file"
+              accept=".json,application/json"
+              style={{ display: "none" }}
+              onChange={handleImportJSONFile}
+            />
+            <button className="btn btn-ghost btn-sm" onClick={handleImportClick} title="استيراد بيانات من ملف Excel">
+              <Upload size={14} /> استيراد Excel
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={handleExportExcel} title="تصدير كل البيانات إلى ملف Excel">
+              <Download size={14} /> تصدير Excel
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={handleImportJSONClick} title="استيراد بيانات من ملف JSON (نسخة احتياطية كاملة)">
+              <Upload size={14} /> استيراد JSON
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={handleExportJSON} title="تصدير كل البيانات إلى ملف JSON (نسخة احتياطية كاملة)">
+              <Download size={14} /> تصدير JSON
+            </button>
+            <button className="btn btn-primary btn-sm" onClick={() => setShowSheetsModal(true)} title="الربط مع Google Sheets">
+              <Cloud size={14} /> جوجل شيت {sheetStatus === "ok" ? "✓" : sheetStatus === "error" ? "⚠" : sheetStatus === "syncing" ? "…" : ""}
+            </button>
+          </div>
+        </div>
+
+        {page === "dashboard" && (
+          <HomePage
+            customers={customers}
+            centers={centers}
+            onOpenCenter={openCenter}
+            onOpenCustomer={goToCustomer}
+            onAddCenter={() => setShowCenterModal(true)}
+          />
+        )}
+
+        {page === "center" && selectedCenter && (() => {
+          const center = centers.find((c) => c.letter === selectedCenter) || { letter: UNCLASSIFIED, name: "بدون مركز", virtual: true };
+          const list = customers.filter((c) => centerKey(c, centers) === center.letter);
+          return (
+            <CenterPage
+              center={center}
+              customers={list}
+              onBack={() => { setSelectedCenter(null); setPage("dashboard"); }}
+              onOpenCustomer={goToCustomer}
+              onAddCustomer={openAddCustomer}
+              onDeleteCenter={deleteCenter}
+            />
+          );
+        })()}
+
+        {page === "details" && selectedCustomer && (
+          <CustomerDetailsPage
+            customer={selectedCustomer}
+            activeAccountId={activeAccountId}
+            onSelectAccount={setActiveAccountId}
+            onBack={() => { setPage(backPage); setSelectedId(null); setActiveAccountId(MAIN_ACCOUNT_ID); }}
+            onEditCustomer={() => openEditCustomer(selectedCustomer)}
+            onDeleteCustomer={() => requestDeleteCustomer(selectedCustomer)}
+            onAddAccount={openAddAccount}
+            onEditAccount={openEditAccount}
+            onDeleteAccount={requestDeleteAccount}
+            onAddVisit={openAddVisit}
+            onEditVisit={openEditVisit}
+            onDeleteVisit={requestDeleteVisit}
+          />
+        )}
+
+        {page === "maintenance" && (
+          <MaintenancePage customers={customers} onOpenCustomer={goToCustomer} />
+        )}
+
+        {showCustomerModal && (
+          <CustomerModal
+            initial={editingCustomer}
+            suggestedCode={editingCustomer ? editingCustomer.code : (selectedCenter && selectedCenter !== UNCLASSIFIED ? nextCodeForCenter(customers, selectedCenter) : nextCustomerCode(customers))}
+            onSave={saveCustomer}
+            onClose={() => { setShowCustomerModal(false); setEditingCustomer(null); }}
+          />
+        )}
+
+        {showCenterModal && (
+          <CenterModal centers={centers} onSave={saveCenter} onClose={() => setShowCenterModal(false)} />
+        )}
+
+        {showAccountModal && selectedCustomer && (
+          <AccountModal
+            initial={editingAccount}
+            defaultAddress={selectedCustomer.address}
+            onSave={saveAccount}
+            onClose={() => { setShowAccountModal(false); setEditingAccount(null); }}
+          />
+        )}
+
+        {showVisitModal && (
+          <VisitModal
+            initial={editingVisit}
+            onSave={saveVisit}
+            onClose={() => { setShowVisitModal(false); setEditingVisit(null); }}
+          />
+        )}
+
+        {confirmState && (
+          <ConfirmModal
+            title={confirmState.title}
+            message={confirmState.message}
+            onConfirm={confirmState.onConfirm}
+            onCancel={() => setConfirmState(null)}
+          />
+        )}
+
+        {pendingImport && (
+          <ImportModeModal
+            count={pendingImport.length}
+            onMerge={handleImportMerge}
+            onReplace={handleImportReplace}
+            onCancel={handleImportCancel}
+          />
+        )}
+
+        {showSheetsModal && (
+          <SheetsModal
+            config={sheetsCfg}
+            status={sheetStatus}
+            count={customers.length}
+            onSave={handleSheetsSave}
+            onPull={handleSheetsPull}
+            onPush={handleSheetsPush}
+            onClose={() => setShowSheetsModal(false)}
+          />
+        )}
+
+        <div className="toast-stack">
+          {toasts.map((t) => <Toast key={t.id} toast={t} />)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const rootEl = document.getElementById("root");
+createRoot(rootEl).render(<OzonApp />);
+
+</script>
+</body>
+</html>
